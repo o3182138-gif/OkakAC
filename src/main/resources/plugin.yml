@@ -3,6 +3,7 @@ version: 1.0
 # Указываем только имя класса, так как он лежит без пакета
 main: Main
 api-version: 1.16
+softdepend: [ProtocolLib]
 commands:
   ac:
     description: Включить/выключить античит
