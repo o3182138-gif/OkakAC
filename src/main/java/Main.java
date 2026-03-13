@@ -48,6 +48,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     private double lHitVariance = 0.02;
     private boolean modelReady = false;
 
+    // Dynamic Speed Limits (обученные)
+    private double baseSpeedLimitH = 0.35;
+
+    // Punishment Mode (kick, warn, flag)
+    private String punishmentMode = "kick";
+
     @Override
     public void onEnable() {
         Bukkit.getPluginManager().registerEvents(this, this);
@@ -89,14 +95,28 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
                 sender.sendMessage("§8[AC] §7Статус защиты: " + (isAntiCheatEnabled ? "§aВКЛ" : "§cВЫКЛ"));
                 return true;
             }
+            if (args.length > 1 && args[0].equalsIgnoreCase("mode")) {
+                String mode = args[1].toLowerCase();
+                if (mode.equals("kick") || mode.equals("warn") || mode.equals("flag")) {
+                    punishmentMode = mode;
+                    sender.sendMessage("§8[AC] §7Режим наказания изменен на: §e" + mode.toUpperCase());
+                } else {
+                    sender.sendMessage("§cИспользование: /ac mode <kick/warn/flag>");
+                }
+                return true;
+            }
         }
 
         if (command.getName().equalsIgnoreCase("acabuch") && args.length >= 4) {
+            // Usage: /acabuch <cheat/legit> <killaura/speed> <player> <on/off>
             Player target = Bukkit.getPlayer(args[2]);
             if (target == null) return false;
+
+            String modeType = args[1].toLowerCase(); // killaura или speed
+
             if (args[3].equalsIgnoreCase("on")) {
-                sessions.put(target.getUniqueId(), new TrainingSession(args[0].equalsIgnoreCase("cheat")));
-                sender.sendMessage("§e[Training] §7Запись: §f" + args[0].toUpperCase());
+                sessions.put(target.getUniqueId(), new TrainingSession(args[0].equalsIgnoreCase("cheat"), modeType));
+                sender.sendMessage("§e[Training] §7Запись §a" + modeType.toUpperCase() + " §7в режиме: §f" + args[0].toUpperCase());
             } else {
                 finishTraining(target.getUniqueId(), sender);
             }
@@ -107,18 +127,33 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     private void finishTraining(UUID uuid, CommandSender sender) {
         TrainingSession s = sessions.get(uuid);
-        if (s == null || s.hits == 0) return;
+        if (s == null) return;
 
-        if (s.isCheat) {
-            cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-            double sHitVariance = 0.0; // Или float, смотря что ты туда записываешь
-            sender.sendMessage("§c[AC] Модель ЧИТА обновлена.");
+        if (s.type.equals("speed")) {
+            if (s.maxSpeedH > 0) {
+                // Если обучали на legit скорость
+                if (!s.isCheat) {
+                    baseSpeedLimitH = s.maxSpeedH + 0.02; // Добавляем небольшую погрешность
+                    sender.sendMessage("§a[AC] Модель ЛЕГИТА (Speed) обновлена. Базовый лимит: " + String.format("%.3f", baseSpeedLimitH));
+                } else {
+                    sender.sendMessage("§c[AC] Запись ЧИТ-скорости завершена (макс: " + String.format("%.3f", s.maxSpeedH) + ")");
+                }
+            } else {
+                sender.sendMessage("§e[Training] Недостаточно данных о скорости.");
+            }
         } else {
-            lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
-            lHitVariance = s.getHitVariance();
-            sender.sendMessage("§a[AC] Модель ЛЕГИТА обновлена.");
+            if (s.hits == 0) return;
+            if (s.isCheat) {
+                cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
+                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+            } else {
+                lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
+                lHitVariance = s.getHitVariance();
+                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+            }
+            modelReady = true;
         }
-        modelReady = true;
+
         sessions.remove(uuid);
     }
 
@@ -147,8 +182,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double speedH = Math.sqrt(distX * distX + distZ * distZ);
         double distY = to.getY() - from.getY();
 
+        // Если включено обучение скорости
+        if (sessions.containsKey(id)) {
+            TrainingSession s = sessions.get(id);
+            if (s.type.equals("speed")) {
+                s.recordSpeed(speedH);
+            }
+        }
+
         // Speed Check
-        double limitH = 0.35; // Base max speed per tick
+        double limitH = baseSpeedLimitH; // Изначально 0.35 или обученное значение
         if (p.isSprinting()) limitH += 0.28;
         if (p.hasPotionEffect(PotionEffectType.SPEED)) {
             limitH += 0.18 * (p.getPotionEffect(PotionEffectType.SPEED).getAmplifier() + 1);
@@ -194,7 +237,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag: §c" + flagReason + " §8(VL: " + vl + ")");
 
             if (vl >= 20) {
-                Bukkit.getScheduler().runTask(this, () -> p.kickPlayer("§cVision: Suspicious Movement"));
+                handlePunishment(p, "Suspicious Movement (" + flagReason + ")");
+                violations.put(id, 0); // Reset after punishing
             }
         } else {
             if (p.isOnGround()) {
@@ -242,27 +286,38 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double distVar = tracker.getDistVariance();
 
         if (sessions.containsKey(uuid)) {
-            sessions.get(uuid).record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
-            return;
+            TrainingSession s = sessions.get(uuid);
+            if (s.type.equals("killaura")) {
+                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                return;
+            }
         }
 
         if (!modelReady) return;
 
         double chance = 0;
 
-        // 1. Static Hitpoint
-        if (Math.abs(hitHeightRatio - tracker.lastHitRatio) < 0.0001) tracker.stableHits++;
-        else tracker.stableHits = 0;
+        // 1. Static Hitpoint / Target Box Checking
+        // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
+        if (Math.abs(hitHeightRatio - tracker.lastHitRatio) < 0.0001) {
+            tracker.stableHits++;
+        } else {
+            tracker.stableHits = 0;
+        }
         tracker.lastHitRatio = hitHeightRatio;
 
-        if (tracker.stableHits >= 3 && (targetMoving || playerMoving)) chance += 55;
+        // Если игрок в движении, и при этом он постоянно бьет ровно в 1 пиксель - это 100% чит.
+        if (tracker.stableHits >= 3 && playerMoving) {
+            chance += 65;
+        }
 
         // 2. Reach Consistency
-        if (distVar < 0.001 && tracker.hitDistances.size() >= 5) chance += 40;
+        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) chance += 40;
 
-        // 3. Aim & Tracking
+        // 3. Aim & Tracking (Прилипание)
+        // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
         if (angle > lAngle * 1.5) chance += 30;
-        if (angle < 1.5 && targetMoving && hitVar < 0.001) chance += 50;
+        if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
@@ -313,8 +368,29 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             int vl = violations.getOrDefault(id, 0) + 1;
             violations.put(id, vl);
             notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ")");
-            if (vl >= 10) Bukkit.getScheduler().runTask(this, () -> p.kickPlayer("§cVision: Suspicious Combat"));
+            if (vl >= 10) {
+                handlePunishment(p, "Suspicious Combat (KillAura/Aim)");
+                violations.put(id, 0);
+                playerProbability.put(id, 0.0);
+            }
         }
+    }
+
+    private void handlePunishment(Player player, String reason) {
+        Bukkit.getScheduler().runTask(this, () -> {
+            switch (punishmentMode.toLowerCase()) {
+                case "kick":
+                    player.kickPlayer("§cVision: " + reason);
+                    break;
+                case "warn":
+                    player.sendMessage("§c§l[ВНИМАНИЕ] §eАнтичит обнаружил подозрительные действия: §f" + reason);
+                    notifyAdmins("§8[§cOkakAC§8] §e" + player.getName() + " §7получил предупреждение за §c" + reason);
+                    break;
+                case "flag":
+                    notifyAdmins("§8[§cOkakAC§8] §c[SILENT FLAG] §e" + player.getName() + " §7должен был быть кикнут за §c" + reason);
+                    break;
+            }
+        });
     }
 
     private boolean hasBlockBetween(Location s, Location e) {
@@ -385,13 +461,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     private static class TrainingSession {
         boolean isCheat;
+        String type; // "killaura" или "speed"
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
+        double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
-        TrainingSession(boolean c) { isCheat = c; }
+        TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
             if (d > maxDist) maxDist = d;
+        }
+        void recordSpeed(double speedH) {
+            if (speedH > maxSpeedH) maxSpeedH = speedH;
         }
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
