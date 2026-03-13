@@ -15,11 +15,25 @@ import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.ProtocolManager;
+import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.PacketAdapter;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.WrappedDataWatcher;
+import com.comphenix.protocol.wrappers.WrappedWatchableObject;
+
 import java.util.*;
 
 public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     private boolean isAntiCheatEnabled = true;
+
+    public boolean isAntiCheatEnabled() {
+        return isAntiCheatEnabled;
+    }
+
     private final Map<UUID, TrainingSession> sessions = new HashMap<>();
     private final Map<UUID, Double> playerProbability = new HashMap<>();
     private final Map<UUID, Integer> violations = new HashMap<>();
@@ -42,7 +56,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         // Очистка CPS каждую секунду
         Bukkit.getScheduler().runTaskTimer(this, cpsTracker::clear, 20L, 20L);
+
+        setupFakeHP();
+
         getLogger().info("OkakAC Vision 7.4 (Full & Dynamic) Loaded.");
+    }
+
+    private void setupFakeHP() {
+        if (Bukkit.getPluginManager().getPlugin("ProtocolLib") == null) {
+            getLogger().warning("ProtocolLib not found! Fake HP feature is disabled.");
+            return;
+        }
+
+        FakeHPHook.register(this);
     }
 
     @Override
@@ -85,7 +111,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         if (s.isCheat) {
             cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-            private double sHitVariance = 0.0; // Или float, смотря что ты туда записываешь
+            double sHitVariance = 0.0; // Или float, смотря что ты туда записываешь
             sender.sendMessage("§c[AC] Модель ЧИТА обновлена.");
         } else {
             lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
@@ -102,16 +128,78 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         Player p = e.getPlayer();
         UUID id = p.getUniqueId();
 
+        Location from = e.getFrom();
+        Location to = e.getTo();
+
+        if (to == null) return;
+
         PlayerMovementTracker t = movementTrackers.computeIfAbsent(id, k -> new PlayerMovementTracker());
-        t.update(e.getFrom(), e.getTo());
+        t.update(from, to);
 
-        double dist = e.getFrom().distance(e.getTo());
-        double limit = 0.68 + (p.hasPotionEffect(PotionEffectType.SPEED) ? 0.18 * (p.getPotionEffect(PotionEffectType.SPEED).getAmplifier() + 1) : 0);
+        if (p.isFlying() || p.getAllowFlight() || p.isInsideVehicle() || p.isGliding() || p.isRiptiding()) {
+            if (p.isOnGround()) lastSafeLocation.put(id, from);
+            return;
+        }
 
-        if (dist > limit && !p.isFlying() && e.getFrom().getY() == e.getTo().getY() && p.getNoDamageTicks() == 0) {
-            e.setTo(lastSafeLocation.getOrDefault(id, e.getFrom()));
+        double distX = to.getX() - from.getX();
+        double distZ = to.getZ() - from.getZ();
+
+        double speedH = Math.sqrt(distX * distX + distZ * distZ);
+        double distY = to.getY() - from.getY();
+
+        // Speed Check
+        double limitH = 0.35; // Base max speed per tick
+        if (p.isSprinting()) limitH += 0.28;
+        if (p.hasPotionEffect(PotionEffectType.SPEED)) {
+            limitH += 0.18 * (p.getPotionEffect(PotionEffectType.SPEED).getAmplifier() + 1);
+        }
+
+        // Ice, slime, etc. can increase speed, so add a bit of leniency
+        if (!p.isOnGround()) {
+            limitH += 0.35; // Jumping allows more horizontal movement per tick
+        }
+
+        boolean flagged = false;
+        String flagReason = "";
+
+        if (speedH > limitH && p.getNoDamageTicks() == 0) {
+            flagged = true;
+            flagReason = "Speed (" + String.format("%.2f", speedH) + " > " + String.format("%.2f", limitH) + ")";
+        }
+
+        // Fly / Hover Check
+        // Gravity usually pulls player down. If they are in air and moving up without jump, or hovering (distY == 0), it's sus.
+        // For simplicity, we check if they are in air for too long without falling properly.
+        if (!p.isOnGround() && !from.getBlock().isLiquid() && !to.getBlock().isLiquid()) {
+            Material blockUnder = to.clone().subtract(0, 0.1, 0).getBlock().getType();
+            if (blockUnder == Material.AIR) {
+                t.airTicks++;
+                if (t.airTicks > 15 && distY >= 0) {
+                    flagged = true;
+                    flagReason = "Fly/Hover (airTicks=" + t.airTicks + ", dy=" + String.format("%.2f", distY) + ")";
+                }
+            } else {
+                t.airTicks = 0;
+            }
         } else {
-            if (p.isOnGround()) lastSafeLocation.put(id, e.getFrom());
+            t.airTicks = 0;
+        }
+
+        if (flagged) {
+            e.setTo(lastSafeLocation.getOrDefault(id, from)); // Rubberband
+
+            // Increment violation and notify
+            int vl = violations.getOrDefault(id, 0) + 1;
+            violations.put(id, vl);
+            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag: §c" + flagReason + " §8(VL: " + vl + ")");
+
+            if (vl >= 20) {
+                Bukkit.getScheduler().runTask(this, () -> p.kickPlayer("§cVision: Suspicious Movement"));
+            }
+        } else {
+            if (p.isOnGround()) {
+                lastSafeLocation.put(id, from);
+            }
         }
     }
 
@@ -181,6 +269,26 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
 
+        // 5. GCD (Greatest Common Divisor) Flaw & Snap
+        // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
+        float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
+        float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
+
+        if (deltaPitch > 0 && deltaPitch < 0.01) {
+            tracker.gcdFlaws++;
+            if (tracker.gcdFlaws > 5) chance += 20;
+        } else {
+            tracker.gcdFlaws = 0;
+        }
+
+        // Обнаружение резких наводок (Snap) перед ударом
+        if (deltaYaw > 25.0 && angle < 5.0) {
+            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        }
+
+        tracker.lastPitch = player.getLocation().getPitch();
+        tracker.lastYaw = player.getLocation().getYaw();
+
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
             sendVisionStats(uuid, player.getName(), dist, angle, hitVar, (double) tracker.stableHits);
@@ -242,6 +350,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double lastHitRatio = -1;
         int stableHits = 0;
         double jitterScore = 0;
+        int gcdFlaws = 0;
+        float lastPitch = 0.0f;
+        float lastYaw = 0.0f;
+        int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
