@@ -12,6 +12,7 @@ import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.WrappedWatchableObject;
 import com.comphenix.protocol.wrappers.PlayerInfoData;
 import com.comphenix.protocol.wrappers.EnumWrappers.NativeGameMode;
+import com.comphenix.protocol.wrappers.WrappedDataWatcher;
 
 import java.util.List;
 import java.util.Random;
@@ -28,8 +29,11 @@ public class FakeHPHook {
         // Создаем фальшивые метаданные здоровья
         float fakeHp = 0.5f + RANDOM.nextFloat() * 34.5f;
 
-        WrappedWatchableObject watchableHealth = new WrappedWatchableObject(8, fakeHp);
-        WrappedWatchableObject watchableAbsorption = new WrappedWatchableObject(14, 0.0f);
+        WrappedDataWatcher.Serializer floatSerializer = WrappedDataWatcher.Registry.get(Float.class);
+        WrappedWatchableObject watchableHealth = new WrappedWatchableObject(
+                new WrappedDataWatcher.WrappedDataWatcherObject(8, floatSerializer), fakeHp);
+        WrappedWatchableObject watchableAbsorption = new WrappedWatchableObject(
+                new WrappedDataWatcher.WrappedDataWatcherObject(14, floatSerializer), 0.0f);
 
         packet.getWatchableCollectionModifier().write(0, java.util.Arrays.asList(watchableHealth, watchableAbsorption));
 

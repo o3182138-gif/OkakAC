@@ -51,6 +51,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     // Dynamic Speed Limits (обученные)
     private double baseSpeedLimitH = 0.35;
+    private double jumpSpeedLimitH = 0.5;
+    private double attackSpeedLimitH = 0.45;
 
     // Punishment Mode (kick, warn, flag)
     private String punishmentMode = "kick";
@@ -170,9 +172,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
                 // Если обучали на legit скорость
                 if (!s.isCheat) {
                     baseSpeedLimitH = s.maxSpeedH + 0.02; // Добавляем небольшую погрешность
-                    sender.sendMessage("§a[AC] Модель ЛЕГИТА (Speed) обновлена. Базовый лимит: " + String.format("%.3f", baseSpeedLimitH));
+                    if (s.maxSpeedJump > 0) jumpSpeedLimitH = s.maxSpeedJump + 0.02;
+                    if (s.maxSpeedAttack > 0) attackSpeedLimitH = s.maxSpeedAttack + 0.02;
+                    sender.sendMessage("§a[AC] Модель ЛЕГИТА (Speed) обновлена. Базовый лимит: " + String.format(Locale.US, "%.3f", baseSpeedLimitH));
                 } else {
-                    sender.sendMessage("§c[AC] Запись ЧИТ-скорости завершена (макс: " + String.format("%.3f", s.maxSpeedH) + ")");
+                    sender.sendMessage("§c[AC] Запись ЧИТ-скорости завершена (макс: " + String.format(Locale.US, "%.3f", s.maxSpeedH) + ")");
                 }
             } else {
                 sender.sendMessage("§e[Training] Недостаточно данных о скорости.");
@@ -229,11 +233,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double speedH = Math.sqrt(distX * distX + distZ * distZ);
         double distY = to.getY() - from.getY();
 
+        boolean isJumping = !from.getBlock().isLiquid() && !from.getBlock().isEmpty() && !p.isOnGround() && distY > 0.0;
+        boolean isAttacked = (System.currentTimeMillis() - t.lastDamageTick) < 1000;
+
         // Если включено обучение скорости
         if (sessions.containsKey(id)) {
             TrainingSession s = sessions.get(id);
             if (s.type.equals("speed")) {
-                s.recordSpeed(speedH);
+                s.recordSpeed(speedH, isJumping, isAttacked);
             }
         }
 
@@ -267,14 +274,17 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
             // Standard Speed Check
             double limitH = baseSpeedLimitH; // Изначально 0.35 или обученное значение
+            if (isJumping) limitH = jumpSpeedLimitH;
+            if (isAttacked) limitH = Math.max(limitH, attackSpeedLimitH);
+
             if (p.isSprinting()) limitH += 0.28;
             if (p.hasPotionEffect(PotionEffectType.SPEED)) {
                 limitH += 0.18 * (p.getPotionEffect(PotionEffectType.SPEED).getAmplifier() + 1);
             }
 
             // Ice, slime, etc. can increase speed, so add a bit of leniency
-            if (!p.isOnGround()) {
-                limitH += 0.35; // Jumping allows more horizontal movement per tick
+            if (!p.isOnGround() && !isJumping) {
+                limitH += 0.35; // Allows more horizontal movement per tick while falling/airborne
             }
 
             if (speedH > limitH && p.getNoDamageTicks() == 0) {
@@ -322,7 +332,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     @EventHandler
     public void onAttack(EntityDamageByEntityEvent event) {
-        if (!isAntiCheatEnabled || !(event.getDamager() instanceof Player)) return;
+        if (!isAntiCheatEnabled) return;
+
+        // Record damage for the victim
+        if (event.getEntity() instanceof Player) {
+            Player victim = (Player) event.getEntity();
+            PlayerMovementTracker victimTracker = movementTrackers.computeIfAbsent(victim.getUniqueId(), k -> new PlayerMovementTracker());
+            victimTracker.lastDamageTick = System.currentTimeMillis();
+        }
+
+        if (!(event.getDamager() instanceof Player)) return;
 
         Player player = (Player) event.getDamager();
         Entity target = event.getEntity();
@@ -543,6 +562,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         float lastYawAccel = 0.0f;
         int airTicks = 0;
         int elytraGainingYTicks = 0;
+        long lastDamageTick = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
@@ -578,6 +598,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
+        double maxSpeedJump = 0;
+        double maxSpeedAttack = 0;
         List<Double> hitHeights = new ArrayList<>();
         float lastDy = 0.0f;
         float lastDp = 0.0f;
@@ -593,8 +615,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             lastDy = dy;
             lastDp = dp;
         }
-        void recordSpeed(double speedH) {
+        void recordSpeed(double speedH, boolean jumped, boolean attacked) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
+            if (jumped && speedH > maxSpeedJump) maxSpeedJump = speedH;
+            if (attacked && speedH > maxSpeedAttack) maxSpeedAttack = speedH;
         }
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
