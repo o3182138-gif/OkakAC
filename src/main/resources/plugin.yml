@@ -11,3 +11,6 @@ commands:
   acabuch:
     description: Режим обучения алгоритма
     usage: /acabuch <cheat/necheat> <killaura> <ник> <on/off>
+  freeze:
+    description: Заморозить игрока на месте
+    usage: /freeze <ник>
