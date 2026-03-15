@@ -46,6 +46,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     private double cReach = 4.0, cAngle = 25.0, cSnap = 45.0, cJitter = 4.0;
     private double lReach = 3.0, lAngle = 12.0, lSnap = 15.0, lJitter = 1.0, lPrecision = 3.0;
     private double lHitVariance = 0.02;
+    private double cAngleVariance = 0.0, lAngleVariance = 5.0; // Новые переменные для дисперсии углов
     private boolean modelReady = false;
 
     // Dynamic Speed Limits (обученные)
@@ -145,10 +146,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (s.hits == 0) return;
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
+                cAngleVariance = s.getAngleVariance();
                 sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
+                lAngleVariance = s.getAngleVariance();
                 sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
             }
             modelReady = true;
@@ -319,10 +322,23 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
-        // 4. CPS
+        // 4. CPS & AutoClicker
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
+
+        long now = System.currentTimeMillis();
+        if (tracker.lastClickTime > 0) {
+            long delay = now - tracker.lastClickTime;
+            tracker.clickTimings.add(delay);
+            if (tracker.clickTimings.size() > 20) tracker.clickTimings.removeFirst();
+        }
+        tracker.lastClickTime = now;
+
+        double clickVar = tracker.getClickVariance();
+        if (tracker.clickTimings.size() >= 10 && clickVar < 15.0 && cps > 8) {
+            chance += 35; // Слишком стабильные клики, характерно для автокликера
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -336,9 +352,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        tracker.recordAngle(angle);
+
+        // Обнаружение резких наводок (Snap) перед ударом с залипанием
+        boolean stickyAim = tracker.angleHistory.size() > 2 && tracker.angleHistory.get(tracker.angleHistory.size() - 2) < 2.0;
+        if (deltaYaw > 15.0 && angle < 2.0 && stickyAim) {
+            chance += 45; // Резко повернулся на большую дистанцию и сразу идеально навелся, удерживая прицел
+        } else if (deltaYaw > 25.0 && angle < 5.0) {
+            chance += 35; // Классический Snap
+        }
+
+        // Проверка на обход с рандомизатором хитбокса
+        if (hitVar > 0.05 && angle < 1.0 && (playerMoving || targetMoving)) {
+            // Игрок бьет в разные части тела (чтобы обойти basic hitbox checks),
+            // но при этом угол постоянно держится прямо на цели (очень точно)
+            chance += 35;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -432,6 +460,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> angleHistory = new LinkedList<>();
+        LinkedList<Long> clickTimings = new LinkedList<>();
+        long lastClickTime = 0;
+
+        void recordAngle(double angle) {
+            angleHistory.add(angle);
+            if (angleHistory.size() > 5) angleHistory.removeFirst();
+        }
+
+        double getClickVariance() {
+            if (clickTimings.size() < 5) return 50.0;
+            double avg = clickTimings.stream().mapToLong(l -> l).average().orElse(0);
+            return clickTimings.stream().mapToDouble(l -> Math.pow(l - avg, 2)).sum() / clickTimings.size();
+        }
 
         void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
@@ -466,10 +508,17 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angleList = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            angleList.add(a);
             if (d > maxDist) maxDist = d;
+        }
+        double getAngleVariance() {
+            if (angleList.size() < 2) return 0;
+            double avg = angleList.stream().mapToDouble(d -> d).average().orElse(0);
+            return angleList.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angleList.size();
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
