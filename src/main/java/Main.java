@@ -145,11 +145,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (s.hits == 0) return;
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена. Ср.угол: " + String.format("%.2f", cAngle) + " Разброс: " + String.format("%.3f", s.getHitVariance()));
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
-                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена. Ср.угол: " + String.format("%.2f", lAngle) + " Разброс: " + String.format("%.3f", s.getHitVariance()));
             }
             modelReady = true;
         }
@@ -281,7 +281,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -319,6 +319,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
+        // Aimbot Constant Look Check
+        if (tracker.hitAngles.size() >= 5 && tracker.getAverageAngle() < 2.0) {
+            chance += 45;
+        }
+
+        // Aimbot Randomizer Check
+        if (tracker.hitAngles.size() >= 5 && tracker.getAverageAngle() < 4.0 && tracker.getHitVariance() > 0.05) {
+            chance += 40;
+        }
+
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
@@ -337,12 +347,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
+        float yawAccel = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        if ((deltaYaw > 25.0 || yawAccel > 25.0) && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
+        tracker.lastDeltaYaw = deltaYaw;
 
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
@@ -429,15 +441,24 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+        float lastDeltaYaw = 0.0f;
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> hitAngles = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            hitAngles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (hitAngles.size() > 10) hitAngles.removeFirst();
+        }
+
+        double getAverageAngle() {
+            if (hitAngles.isEmpty()) return 0.0;
+            return hitAngles.stream().mapToDouble(d -> d).average().orElse(0.0);
         }
 
         double getHitVariance() {
