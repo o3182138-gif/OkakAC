@@ -143,13 +143,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             }
         } else {
             if (s.hits == 0) return;
+
+            String stats = String.format("§7[Статистика] Удары: §f%d§7, Дисперсия углов: §f%.2f§7, Ср. Yaw/Pitch: §f%.2f/%.2f",
+                    s.hits, s.getAngleVariance(), s.getAvgDeltaYaw(), s.getAvgDeltaPitch());
+
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
                 sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage(stats);
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
                 sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage(stats);
             }
             modelReady = true;
         }
@@ -285,10 +291,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
+        float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
+        float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
+
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
-                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio, deltaYaw, deltaPitch);
                 return;
             }
         }
@@ -324,11 +333,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
 
-        // 5. GCD (Greatest Common Divisor) Flaw & Snap
+        // 5. GCD (Greatest Common Divisor) Flaw
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
-        float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
-        float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
-
         if (deltaPitch > 0 && deltaPitch < 0.01) {
             tracker.gcdFlaws++;
             if (tracker.gcdFlaws > 5) chance += 20;
@@ -336,11 +342,52 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
+        // 6. Невозможный Pitch
+        float pitch = player.getLocation().getPitch();
+        if (pitch > 90.0f || pitch < -90.0f) {
+            chance += 100; // 100% чит
+        }
+
+        // 7. MultiAura (смена цели за очень короткое время)
+        long currentTime = System.currentTimeMillis();
+        if (tracker.lastTarget != null && !tracker.lastTarget.equals(target.getUniqueId())) {
+            long timeDiff = currentTime - tracker.lastAttackTime;
+            if (timeDiff < 50) {
+                chance += 50; // Быстрая смена цели
+            }
+        }
+        tracker.lastTarget = target.getUniqueId();
+        tracker.lastAttackTime = currentTime;
+
+        // 8. Снапы (Snap Check) - улучшенный
+        // Если в прошлый тик повернулся сильно, а сейчас почти не повернулся, но идеально навелся
+        if (tracker.lastDeltaYaw > 20.0f && deltaYaw < 2.0f && angle < 5.0) {
+            chance += 40;
+        } else if (deltaYaw > 25.0 && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
+        // 9. Рандомайзер головы (Randomizer Check)
+        // Если изменения хаотичны, но при этом точность попадания (угол) остается идеальной
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        float accelPitch = Math.abs(deltaPitch - tracker.lastDeltaPitch);
+
+        if (accelYaw > 10.0f && accelPitch > 10.0f && angle < lAngle * 1.2 && hitVar > 0.05) {
+            chance += 35;
+        }
+
+        // 10. Постоянная наводка (Constant Aim)
+        if (playerMoving && angle < 2.0) {
+            tracker.constantAimTicks++;
+            if (tracker.constantAimTicks > 4) {
+                chance += 45; // Постоянно идеально нацелен во время движения
+            }
+        } else {
+            tracker.constantAimTicks = 0;
+        }
+
+        tracker.lastDeltaYaw = deltaYaw;
+        tracker.lastDeltaPitch = deltaPitch;
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
 
@@ -429,6 +476,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+        float lastDeltaYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
+        UUID lastTarget = null;
+        long lastAttackTime = 0;
+        int constantAimTicks = 0;
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
@@ -466,18 +518,44 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
+        List<Double> deltaYaws = new ArrayList<>();
+        List<Double> deltaPitches = new ArrayList<>();
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
-        void record(double d, double j, double a, double s, float p, double h) {
+
+        void record(double d, double j, double a, double s, float p, double h, double deltaYaw, double deltaPitch) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            angles.add(a);
+            deltaYaws.add(deltaYaw);
+            deltaPitches.add(deltaPitch);
             if (d > maxDist) maxDist = d;
         }
+
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
         }
+
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+
+        double getAvgDeltaYaw() {
+            if (deltaYaws.isEmpty()) return 0;
+            return deltaYaws.stream().mapToDouble(d -> d).average().orElse(0);
+        }
+
+        double getAvgDeltaPitch() {
+            if (deltaPitches.isEmpty()) return 0;
+            return deltaPitches.stream().mapToDouble(d -> d).average().orElse(0);
         }
     }
 }
