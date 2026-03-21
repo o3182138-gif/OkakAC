@@ -228,6 +228,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             t.airTicks = 0;
         }
 
+        // NoFall Check
+        // Игрок падает вниз, но при этом сообщает серверу, что его падение = 0, либо он находится на земле
+        if (distY < -0.1 && t.airTicks > 5) {
+            if (p.getFallDistance() == 0.0f) {
+                flagged = true;
+                flagReason = "NoFall (fallDistance=0 in air)";
+            }
+        }
+
         if (flagged) {
             e.setTo(lastSafeLocation.getOrDefault(id, from)); // Rubberband
 
@@ -281,9 +290,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
+        double angleVar = tracker.getAngleVariance();
 
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
@@ -341,6 +351,44 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
+        // Обнаружение неестественного ускорения поворота головы
+        float yawAccel = Math.abs(deltaYaw - tracker.lastYawDelta);
+        float pitchAccel = Math.abs(deltaPitch - tracker.lastPitchDelta);
+
+        if (yawAccel > 30.0f && deltaYaw < 2.0f && angle < 5.0) {
+            // Мгновенная остановка после быстрого поворота
+            chance += 30;
+        }
+
+        // Обнаружение постоянного угла наводки (Constant Aim) с микро-рандомизацией
+        if (tracker.attackAngles.size() >= 5 && angleVar < 1.0 && angleVar > 0.001) {
+            // Дисперсия угла очень мала, но не нулевая (что значит используется микро-рандомизатор головы)
+            chance += 40;
+        }
+
+        // Обнаружение Multi-Aura / Быстрое переключение целей
+        if (tracker.lastTarget != null && !tracker.lastTarget.equals(target.getUniqueId())) {
+            long timeSinceLastAttack = System.currentTimeMillis() - tracker.lastAttackTime;
+            if (timeSinceLastAttack < 150 && deltaYaw > 45.0) {
+                // Игрок сменил цель менее чем за 150мс с большим поворотом головы
+                chance += 50;
+            }
+        }
+
+        // Обнаружение AutoClicker (Идеальные тайминги между ударами)
+        double intervalVar = tracker.getIntervalVariance();
+        if (tracker.attackIntervals.size() >= 10 && intervalVar < 15.0) {
+            // Дисперсия задержки между ударами менее 15 мс (почти идеальные клики)
+            chance += 45;
+        } else if (tracker.attackIntervals.size() >= 10 && intervalVar < 40.0) {
+            chance += 20;
+        }
+
+        tracker.lastTarget = target.getUniqueId();
+        tracker.lastAttackTime = System.currentTimeMillis();
+
+        tracker.lastYawDelta = deltaYaw;
+        tracker.lastPitchDelta = deltaPitch;
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
 
@@ -432,18 +480,49 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> attackAngles = new LinkedList<>();
+        LinkedList<Long> attackIntervals = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        float lastYawDelta = 0.0f;
+        float lastPitchDelta = 0.0f;
+
+        UUID lastTarget = null;
+        long lastAttackTime = 0;
+
+        void recordHit(double dist, double ratio, double angle) {
+            long now = System.currentTimeMillis();
+            if (lastAttackTime != 0) {
+                long interval = now - lastAttackTime;
+                // Не учитываем слишком большие перерывы (скорее всего перестал бить)
+                if (interval < 1000) {
+                    attackIntervals.add(interval);
+                    if (attackIntervals.size() > 20) attackIntervals.removeFirst();
+                }
+            }
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            attackAngles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (attackAngles.size() > 10) attackAngles.removeFirst();
+        }
+
+        double getAngleVariance() {
+            if (attackAngles.size() < 3) return 1.0;
+            double avg = attackAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return attackAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / attackAngles.size();
         }
 
         double getHitVariance() {
             if (hitRatios.size() < 3) return 0.1;
             double avg = hitRatios.stream().mapToDouble(d -> d).average().orElse(0);
             return hitRatios.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitRatios.size();
+        }
+
+        double getIntervalVariance() {
+            if (attackIntervals.size() < 5) return 100.0;
+            double avg = attackIntervals.stream().mapToDouble(l -> l).average().orElse(0);
+            return attackIntervals.stream().mapToDouble(l -> Math.pow(l - avg, 2)).sum() / attackIntervals.size();
         }
 
         double getDistVariance() {
@@ -466,9 +545,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> attackAngles = new ArrayList<>();
+        List<Long> attackIntervals = new ArrayList<>();
+        long lastAttackTime = 0;
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
+
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            long now = System.currentTimeMillis();
+            if (lastAttackTime != 0) {
+                long interval = now - lastAttackTime;
+                if (interval < 1000) attackIntervals.add(interval);
+            }
+            lastAttackTime = now;
+
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); attackAngles.add(a);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
@@ -478,6 +569,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+
+        double getAngleVariance() {
+            if (attackAngles.size() < 2) return 0;
+            double avg = attackAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return attackAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / attackAngles.size();
+        }
+
+        double getIntervalVariance() {
+            if (attackIntervals.size() < 2) return 0;
+            double avg = attackIntervals.stream().mapToDouble(l -> l).average().orElse(0);
+            return attackIntervals.stream().mapToDouble(l -> Math.pow(l - avg, 2)).sum() / attackIntervals.size();
         }
     }
 }
