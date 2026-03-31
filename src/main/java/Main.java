@@ -281,7 +281,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -336,11 +336,39 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
+        // 6. Autoclicker (Delay Consistency)
+        double delayVar = tracker.getDelayVariance();
+        if (tracker.hitDelays.size() >= 5 && delayVar < 50.0) { // если разброс задержек меньше 50мс
+            chance += 30;
+        }
+
+        // 7. Track (Constant KillAura with randomizer)
+        double angleVar = tracker.getAngleVariance();
+        if (tracker.angleHistory.size() >= 5) {
+            // Если угол почти не меняется (идеальное слежение) и разброс углов крайне мал, но при этом игрок/цель двигаются
+            if (angleVar < 2.0 && angle < 15.0 && (playerMoving || targetMoving)) {
+                chance += 45;
+            }
+        }
+
+        // 8. MultiAura / Derp
+        if (angle > 45.0) {
+            chance += 60; // Удар с разворотом головы (спиной или сильно сбоку)
+        }
+
+        // Обнаружение резких наводок (Snap) перед ударом с учетом ускорения
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        float accelPitch = Math.abs(deltaPitch - tracker.lastDeltaPitch);
+
         if (deltaYaw > 25.0 && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
+        if (accelYaw > 30.0f && angle < 3.0) {
+            chance += 40; // Огромное ускорение прицела и мгновенная остановка прямо на цели
+        }
 
+        tracker.lastDeltaYaw = deltaYaw;
+        tracker.lastDeltaPitch = deltaPitch;
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
 
@@ -425,6 +453,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     private static class PlayerMovementTracker {
         double lastHitRatio = -1;
         int stableHits = 0;
+        long lastHitTime = 0;
+        LinkedList<Long> hitDelays = new LinkedList<>();
+        LinkedList<Double> angleHistory = new LinkedList<>();
+        float lastDeltaYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
         double jitterScore = 0;
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
@@ -433,11 +466,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            angleHistory.add(angle);
+
+            long now = System.currentTimeMillis();
+            if (lastHitTime != 0) {
+                hitDelays.add(now - lastHitTime);
+            }
+            lastHitTime = now;
+
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (angleHistory.size() > 10) angleHistory.removeFirst();
+            if (hitDelays.size() > 10) hitDelays.removeFirst();
         }
 
         double getHitVariance() {
@@ -450,6 +493,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitDistances.size() < 3) return 0.1;
             double avg = hitDistances.stream().mapToDouble(d -> d).average().orElse(0);
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
+        }
+
+        double getAngleVariance() {
+            if (angleHistory.size() < 3) return 10.0;
+            double avg = angleHistory.stream().mapToDouble(d -> d).average().orElse(0);
+            return angleHistory.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angleHistory.size();
+        }
+
+        double getDelayVariance() {
+            if (hitDelays.size() < 3) return 100.0;
+            double avg = hitDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
         }
 
         void update(Location f, Location t) {
@@ -466,10 +521,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> hitAngles = new ArrayList<>();
+        List<Long> hitDelays = new ArrayList<>();
+        long lastHitTime = 0;
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); hitAngles.add(a);
             if (d > maxDist) maxDist = d;
+
+            long now = System.currentTimeMillis();
+            if (lastHitTime != 0) hitDelays.add(now - lastHitTime);
+            lastHitTime = now;
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
@@ -478,6 +541,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+
+        double getAngleVariance() {
+            if (hitAngles.size() < 2) return 0;
+            double avg = hitAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitAngles.size();
+        }
+
+        double getDelayVariance() {
+            if (hitDelays.size() < 2) return 0;
+            double avg = hitDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
         }
     }
 }
