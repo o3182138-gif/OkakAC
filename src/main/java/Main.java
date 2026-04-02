@@ -8,6 +8,7 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -60,8 +61,25 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         getCommand("ac").setExecutor(this);
         getCommand("acabuch").setExecutor(this);
 
-        // Очистка CPS каждую секунду
-        Bukkit.getScheduler().runTaskTimer(this, cpsTracker::clear, 20L, 20L);
+        // Запись и очистка CPS каждую секунду
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            for (Map.Entry<UUID, Integer> entry : cpsTracker.entrySet()) {
+                UUID uuid = entry.getKey();
+                int cps = entry.getValue();
+                PlayerMovementTracker tracker = movementTrackers.get(uuid);
+                if (tracker != null) {
+                    tracker.recordCps(cps);
+                }
+
+                if (sessions.containsKey(uuid)) {
+                    TrainingSession s = sessions.get(uuid);
+                    if (s.type.equals("autoclicker")) {
+                        s.recordCps(cps);
+                    }
+                }
+            }
+            cpsTracker.clear();
+        }, 20L, 20L);
 
         setupFakeHP();
 
@@ -108,11 +126,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         if (command.getName().equalsIgnoreCase("acabuch") && args.length >= 4) {
-            // Usage: /acabuch <cheat/legit> <killaura/speed> <player> <on/off>
+            // Usage: /acabuch <cheat/legit> <killaura/speed/autoclicker> <player> <on/off>
             Player target = Bukkit.getPlayer(args[2]);
             if (target == null) return false;
 
-            String modeType = args[1].toLowerCase(); // killaura или speed
+            String modeType = args[1].toLowerCase(); // killaura, speed, или autoclicker
 
             if (args[3].equalsIgnoreCase("on")) {
                 sessions.put(target.getUniqueId(), new TrainingSession(args[0].equalsIgnoreCase("cheat"), modeType));
@@ -141,20 +159,44 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             } else {
                 sender.sendMessage("§e[Training] Недостаточно данных о скорости.");
             }
+        } else if (s.type.equals("autoclicker")) {
+            if (s.cpsHistory.size() > 0) {
+                sender.sendMessage("§e[AC] Запись AutoClicker завершена. Средняя дисперсия: " + String.format("%.3f", s.getCpsVariance()));
+            } else {
+                sender.sendMessage("§e[Training] Недостаточно данных о CPS.");
+            }
         } else {
             if (s.hits == 0) return;
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена. Дисперсия угла: " + String.format("%.3f", s.getAngleVariance()));
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
-                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена. Дисперсия угла: " + String.format("%.3f", s.getAngleVariance()));
             }
             modelReady = true;
         }
 
         sessions.remove(uuid);
+    }
+
+    @EventHandler
+    public void onBlockPlace(BlockPlaceEvent e) {
+        if (!isAntiCheatEnabled) return;
+        Player p = e.getPlayer();
+
+        // Scaffold Check
+        // Если игрок спринтит назад (или быстро двигается) и при этом смотрит сильно вниз, это типично для Scaffold
+        if (p.isSprinting() && p.getLocation().getPitch() > 75.0f) {
+            // Дополнительно проверяем скорость движения. Если он ставит блоки под себя на бегу.
+            PlayerMovementTracker t = movementTrackers.get(p.getUniqueId());
+            if (t != null) {
+                // Если он ставит блок, смотря вниз, и при этом быстро двигается
+                // Это базовая эвристика. Scaffold часто ставит блоки с высоким Pitch
+                processViolation(p, 25);
+            }
+        }
     }
 
     @EventHandler
@@ -237,7 +279,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag: §c" + flagReason + " §8(VL: " + vl + ")");
 
             if (vl >= 20) {
-                handlePunishment(p, "Suspicious Movement (" + flagReason + ")");
+                handlePunishment(p, "Подозрительное движение (" + flagReason + ")");
                 violations.put(id, 0); // Reset after punishing
             }
         } else {
@@ -281,7 +323,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -314,15 +356,35 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // 2. Reach Consistency
         if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) chance += 40;
 
+        // Impossible Pitch Check
+        if (player.getLocation().getPitch() > 90.0f || player.getLocation().getPitch() < -90.0f) {
+            event.setCancelled(true);
+            processViolation(player, 100);
+            return;
+        }
+
         // 3. Aim & Tracking (Прилипание)
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
-        // 4. CPS
+        // Constant Aim Check: очень низкая дисперсия угла (постоянно смотрит ровно в одну точку на цели)
+        double angleVar = tracker.getAngleVariance();
+        if (angleVar < 0.5 && tracker.angles.size() >= 5 && (targetMoving || playerMoving)) {
+            chance += 35;
+        }
+
+        // 4. CPS & AutoClicker Check
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
+
         if (cps > 15) chance += 25;
+
+        // AutoClicker Consistency: Если CPS очень стабильный, это признак макроса/автокликера
+        double cpsVar = tracker.getCpsVariance();
+        if (cpsVar < 0.2 && tracker.cpsHistory.size() >= 5 && cps > 8) {
+            chance += 30; // Человек не может кликать с нулевой дисперсией
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -337,8 +399,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
+        if ((deltaYaw > 25.0 || deltaPitch > 15.0) && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        }
+
+        // Randomizer Check: высокий джиттер (дерганье головы), но угол всегда мал (все равно смотрит на игрока)
+        if (tracker.jitterScore > 4.0 && angle < 10.0) {
+            chance += 20;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -369,7 +436,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             violations.put(id, vl);
             notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ")");
             if (vl >= 10) {
-                handlePunishment(p, "Suspicious Combat (KillAura/Aim)");
+                handlePunishment(p, "Подозрительный бой (KillAura/Aim)");
                 violations.put(id, 0);
                 playerProbability.put(id, 0.0);
             }
@@ -380,14 +447,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         Bukkit.getScheduler().runTask(this, () -> {
             switch (punishmentMode.toLowerCase()) {
                 case "kick":
-                    player.kickPlayer("§cVision: " + reason);
+                    player.kickPlayer("§cVision: Вы были кикнуты за " + reason);
                     break;
                 case "warn":
                     player.sendMessage("§c§l[ВНИМАНИЕ] §eАнтичит обнаружил подозрительные действия: §f" + reason);
                     notifyAdmins("§8[§cOkakAC§8] §e" + player.getName() + " §7получил предупреждение за §c" + reason);
                     break;
                 case "flag":
-                    notifyAdmins("§8[§cOkakAC§8] §c[SILENT FLAG] §e" + player.getName() + " §7должен был быть кикнут за §c" + reason);
+                    notifyAdmins("§8[§cOkakAC§8] §c[СКРЫТЫЙ ФЛАГ] §e" + player.getName() + " §7должен был быть кикнут за §c" + reason);
                     break;
             }
         });
@@ -432,12 +499,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> angles = new LinkedList<>();
+        LinkedList<Integer> cpsHistory = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            angles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (angles.size() > 10) angles.removeFirst();
+        }
+
+        void recordCps(int cps) {
+            cpsHistory.add(cps);
+            if (cpsHistory.size() > 10) cpsHistory.removeFirst();
         }
 
         double getHitVariance() {
@@ -452,32 +528,64 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
 
+        double getAngleVariance() {
+            if (angles.size() < 3) return 0.1;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+
+        double getCpsVariance() {
+            if (cpsHistory.size() < 3) return 1.0;
+            double avg = cpsHistory.stream().mapToDouble(d -> d).average().orElse(0);
+            return cpsHistory.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / cpsHistory.size();
+        }
+
         void update(Location f, Location t) {
             double dy = Math.abs(t.getYaw() - f.getYaw());
-            if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
-            else jitterScore = Math.max(0, jitterScore - 0.1);
+            double dp = Math.abs(t.getPitch() - f.getPitch());
+            // Увеличиваем джиттер, если есть мелкие резкие движения (типично для рандомайзеров киллауры)
+            if ((dy > 0.1 && dy < 15) || (dp > 0.1 && dp < 15)) {
+                jitterScore = Math.min(10, jitterScore + 0.5);
+            } else {
+                jitterScore = Math.max(0, jitterScore - 0.2);
+            }
         }
     }
 
     private static class TrainingSession {
         boolean isCheat;
-        String type; // "killaura" или "speed"
+        String type; // "killaura", "speed" или "autoclicker"
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
+        List<Integer> cpsHistory = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); angles.add(a);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
         }
+        void recordCps(int cps) {
+            cpsHistory.add(cps);
+        }
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+        double getCpsVariance() {
+            if (cpsHistory.size() < 2) return 0;
+            double avg = cpsHistory.stream().mapToDouble(d -> d).average().orElse(0);
+            return cpsHistory.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / cpsHistory.size();
         }
     }
 }
