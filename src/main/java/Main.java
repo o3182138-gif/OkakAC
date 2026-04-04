@@ -145,11 +145,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (s.hits == 0) return;
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                cSnap = cAngle + Math.sqrt(s.getAngleVariance());
+                cJitter = Math.sqrt(s.getJitterVariance());
+                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена. (cSnap: " + String.format("%.1f", cSnap) + ")");
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
-                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                lSnap = lAngle + Math.sqrt(s.getAngleVariance()) * 1.5;
+                lJitter = Math.sqrt(s.getJitterVariance());
+                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена. (lSnap: " + String.format("%.1f", lSnap) + ")");
             }
             modelReady = true;
         }
@@ -226,6 +230,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             }
         } else {
             t.airTicks = 0;
+        }
+
+        // NoFall Check
+        // Если игрок утверждает, что он на земле, но падает, и под ним воздух.
+        if (p.isOnGround() && distY < -0.1 && !from.getBlock().isLiquid() && !to.getBlock().isLiquid()) {
+            Material blockUnder = to.clone().subtract(0, 0.1, 0).getBlock().getType();
+            if (blockUnder == Material.AIR) {
+                flagged = true;
+                flagReason = "NoFall (Spoofed Ground Status)";
+            }
         }
 
         if (flagged) {
@@ -324,7 +338,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
 
-        // 5. GCD (Greatest Common Divisor) Flaw & Snap
+        // 5. GCD (Greatest Common Divisor) Flaw & Snap & Head Randomizer
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
         float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
         float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
@@ -336,9 +350,24 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        // Улучшенное обнаружение резких наводок (Snap) перед ударом
+        if (deltaYaw > lSnap && angle < lAngle) {
+            tracker.snapCount++;
+            if (tracker.snapCount > 2) chance += 45; // Систематические резкие и точные наводки
+        } else if (angle >= lAngle) {
+            tracker.snapCount = 0;
+        }
+
+        // Обнаружение Head Randomizer (постоянная киллаура с рандомизатором головы)
+        if (angle < lAngle) {
+            if ((deltaYaw > lJitter && deltaYaw < cJitter) || (deltaPitch > lJitter && deltaPitch < cJitter)) {
+                if (hitVar < lHitVariance && hitVar > 0.001) {
+                    tracker.randomizerJitter++;
+                    if (tracker.randomizerJitter > 4) chance += 35; // Прицел дрожит, но точка удара стабильна
+                }
+            }
+        } else {
+            tracker.randomizerJitter = 0;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -430,6 +459,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
         int airTicks = 0;
+        int snapCount = 0;
+        int randomizerJitter = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
@@ -466,9 +497,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
+        List<Double> jitters = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            angles.add(a); jitters.add(j);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
@@ -478,6 +512,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+        double getJitterVariance() {
+            if (jitters.size() < 2) return 0;
+            double avg = jitters.stream().mapToDouble(d -> d).average().orElse(0);
+            return jitters.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / jitters.size();
         }
     }
 }
