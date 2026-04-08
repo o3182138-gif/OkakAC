@@ -9,6 +9,8 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.player.PlayerAnimationEvent;
+import org.bukkit.event.player.PlayerAnimationType;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffectType;
@@ -248,6 +250,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     @EventHandler
+    public void onAnimation(PlayerAnimationEvent event) {
+        if (!isAntiCheatEnabled) return;
+        if (event.getAnimationType() == PlayerAnimationType.ARM_SWING) {
+            PlayerMovementTracker tracker = movementTrackers.computeIfAbsent(event.getPlayer().getUniqueId(), k -> new PlayerMovementTracker());
+            tracker.lastArmSwingTime = System.currentTimeMillis();
+        }
+    }
+
+    @EventHandler
     public void onAttack(EntityDamageByEntityEvent event) {
         if (!isAntiCheatEnabled || !(event.getDamager() instanceof Player)) return;
 
@@ -281,7 +292,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        long currentTime = System.currentTimeMillis();
+        tracker.recordHit(dist, hitHeightRatio, currentTime);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -336,9 +348,34 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
+        // Улучшенное обнаружение резких наводок (Snap) перед ударом
+        // Если игрок быстро повернулся, а затем резко остановился (маленький deltaYaw) и удар очень точный
+        if (tracker.yawChanges.size() >= 2) {
+            float previousDeltaYaw = tracker.yawChanges.get(tracker.yawChanges.size() - 2);
+            if (previousDeltaYaw > 30.0 && deltaYaw < 2.0 && angle < 3.0) {
+                chance += 45; // Очень резкая остановка после быстрого поворота, идеальная наводка
+            }
+        }
+
+        // Базовый Snap, если предыдущих данных недостаточно
         if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+            chance += 35;
+        }
+
+        // 6. Jitter / Рандомизатор наводки (попытка обхода)
+        // Если игрок постоянно меняет направление взгляда влево-вправо, удерживая цель в центре
+        if (tracker.directionChanges > 8 && angle < 10.0) {
+            chance += 25; // Искусственная тряска прицела
+        }
+
+        // 7. AutoClicker - дисперсия задержек кликов
+        double delayVariance = tracker.getDelayVariance();
+        if (tracker.hitDelays.size() >= 5) {
+            if (delayVariance < 15.0) { // Идеально ровные клики (робот)
+                chance += 30;
+            } else if (delayVariance < 50.0) { // Подозрительно ровные клики
+                chance += 15;
+            }
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -433,11 +470,26 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        // Новые поля для эвристики головы (Yaw/Pitch) и кликов
+        long lastHitTime = 0;
+        LinkedList<Long> hitDelays = new LinkedList<>();
+        LinkedList<Float> yawChanges = new LinkedList<>();
+        float lastDeltaYaw = 0.0f;
+        int directionChanges = 0;
+
+        long lastArmSwingTime = 0;
+
+        void recordHit(double dist, double ratio, long time) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+
+            if (lastHitTime > 0) {
+                hitDelays.add(time - lastHitTime);
+                if (hitDelays.size() > 10) hitDelays.removeFirst();
+            }
+            lastHitTime = time;
         }
 
         double getHitVariance() {
@@ -452,9 +504,32 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
 
+        double getDelayVariance() {
+            if (hitDelays.size() < 3) return 100.0;
+            double avg = hitDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
+        }
+
         void update(Location f, Location t) {
-            double dy = Math.abs(t.getYaw() - f.getYaw());
-            if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
+            float currentYaw = t.getYaw();
+            float deltaYaw = Math.abs(currentYaw - f.getYaw());
+
+            // Запись изменения Yaw для проверки на киллауру с рандомайзером (jitter)
+            if (deltaYaw > 0) {
+                yawChanges.add(deltaYaw);
+                if (yawChanges.size() > 20) yawChanges.removeFirst();
+            }
+
+            // Отслеживание смены направления (влево/вправо)
+            float realDeltaYaw = currentYaw - f.getYaw();
+            if ((realDeltaYaw > 0 && lastDeltaYaw < 0) || (realDeltaYaw < 0 && lastDeltaYaw > 0)) {
+                directionChanges++;
+            } else if (directionChanges > 0) {
+                directionChanges--; // Постепенно уменьшаем счетчик, если движения плавные
+            }
+            lastDeltaYaw = realDeltaYaw;
+
+            if (deltaYaw > 0.1 && deltaYaw < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
         }
     }
@@ -466,9 +541,25 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
+        List<Double> hitDistances = new ArrayList<>();
+        List<Long> clickDelays = new ArrayList<>();
+        long lastClickTime = 0;
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
+
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a;
+            hitHeights.add(h);
+            angles.add(a);
+            hitDistances.add(d);
+
+            long currentTime = System.currentTimeMillis();
+            if (lastClickTime > 0) {
+                clickDelays.add(currentTime - lastClickTime);
+            }
+            lastClickTime = currentTime;
+
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
@@ -478,6 +569,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+        double getDistVariance() {
+            if (hitDistances.size() < 2) return 0;
+            double avg = hitDistances.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
     }
 }
