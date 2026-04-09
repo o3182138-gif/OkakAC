@@ -285,10 +285,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
+        float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
+        float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
+
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        float accelPitch = Math.abs(deltaPitch - tracker.lastDeltaPitch);
+
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
-                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio, accelYaw);
+                tracker.lastPitch = player.getLocation().getPitch();
+                tracker.lastYaw = player.getLocation().getYaw();
+                tracker.lastDeltaPitch = deltaPitch;
+                tracker.lastDeltaYaw = deltaYaw;
                 return;
             }
         }
@@ -326,8 +336,6 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
-        float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
-        float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
 
         if (deltaPitch > 0 && deltaPitch < 0.01) {
             tracker.gcdFlaws++;
@@ -337,12 +345,32 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        // Если ускорение наводки (разница между текущим поворотом и предыдущим поворотом)
+        // слишком велико, и игрок идеально наводится.
+        if (accelYaw > 15.0 && angle < 5.0) {
+            chance += 35; // Неестественно высокое ускорение перед ударом
+        }
+
+        // 6. Проверка на рандомизатор (Randomizer Check)
+        // Постоянная киллаура может чуть-чуть использовать рандомайзер головы
+        // Если дисперсия высоты удара большая (рандомизация), но точность при этом идеальная (угол близок к нулю)
+        if (hitVar > 0.05 && angle < 1.0 && playerMoving) {
+            chance += 45; // Рандомизация хитбокса при идеальной наводке
+        }
+
+        // 7. Проверка на Cinematic / Smooth Aim
+        // Если дельта угла не меняется (ускорение близко к 0) во время движения головы (deltaYaw > 0), это роботизированно
+        if (accelYaw < 0.01 && deltaYaw > 1.0) {
+            tracker.smoothTicks++;
+            if (tracker.smoothTicks > 3) chance += 30; // Слишком плавная наводка
+        } else {
+            tracker.smoothTicks = 0;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
+        tracker.lastDeltaPitch = deltaPitch;
+        tracker.lastDeltaYaw = deltaYaw;
 
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
@@ -427,8 +455,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int stableHits = 0;
         double jitterScore = 0;
         int gcdFlaws = 0;
+        int smoothTicks = 0;
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
+        float lastDeltaYaw = 0.0f;
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
@@ -467,8 +498,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
-        void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+        double totalAccel = 0;
+
+        void record(double d, double j, double a, double s, float p, double h, double accel) {
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); totalAccel += accel;
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
