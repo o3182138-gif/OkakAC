@@ -10,6 +10,8 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerAnimationEvent;
+import org.bukkit.event.player.PlayerAnimationType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.RayTraceResult;
@@ -145,16 +147,30 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (s.hits == 0) return;
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
-                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена. Вар. кликов: " + String.format("%.2f", s.getDelayVariance()));
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
-                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена. Вар. кликов: " + String.format("%.2f", s.getDelayVariance()));
             }
             modelReady = true;
         }
 
         sessions.remove(uuid);
+    }
+
+    @EventHandler
+    public void onAnimation(PlayerAnimationEvent event) {
+        if (!isAntiCheatEnabled) return;
+        Player p = event.getPlayer();
+        if (event.getAnimationType() == PlayerAnimationType.ARM_SWING) {
+            UUID id = p.getUniqueId();
+            PlayerMovementTracker tracker = movementTrackers.computeIfAbsent(id, k -> new PlayerMovementTracker());
+            tracker.swings++;
+
+            int cps = cpsTracker.getOrDefault(id, 0) + 1;
+            cpsTracker.put(id, cps);
+        }
     }
 
     @EventHandler
@@ -285,6 +301,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
+        tracker.hits++;
+        long now = System.currentTimeMillis();
+        if (tracker.lastHitTime > 0) {
+            tracker.hitDelays.add(now - tracker.lastHitTime);
+            if (tracker.hitDelays.size() > 20) tracker.hitDelays.removeFirst();
+        }
+        tracker.lastHitTime = now;
+
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
@@ -320,9 +344,24 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
         // 4. CPS
-        int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
-        cpsTracker.put(uuid, cps);
+        int cps = cpsTracker.getOrDefault(uuid, 0);
         if (cps > 15) chance += 25;
+
+        // AutoClicker / Consistent Delay
+        if (tracker.hitDelays.size() >= 10 && tracker.getDelayVariance() < 5.0) {
+            chance += 30;
+        }
+
+        // NoSwing
+        if (tracker.hits > tracker.swings + 2) {
+            chance += 50;
+        }
+
+        // Randomized / Smooth Tracking (Обход рандомизации)
+        if (tracker.jitterScore > 3.0 && Math.abs(angle - tracker.lastAngle) < 0.5 && playerMoving) {
+            chance += 25;
+        }
+        tracker.lastAngle = angle;
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -337,8 +376,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if (tracker.latestAccelYaw > 20.0 && angle < 1.5) {
+            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся (Snap)
+        } else if (deltaYaw > 25.0 && angle < 5.0) {
+            chance += 35; // Обычный старый Snap check
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -433,6 +474,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
+        int swings = 0;
+        int hits = 0;
+        LinkedList<Long> hitDelays = new LinkedList<>();
+        long lastHitTime = 0;
+        float latestDeltaYaw = 0;
+        float latestDeltaPitch = 0;
+        float lastDeltaYaw = 0;
+        float latestAccelYaw = 0;
+        double lastAngle = 0;
+
         void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
@@ -452,10 +503,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
 
+        double getDelayVariance() {
+            if (hitDelays.size() < 3) return 100.0;
+            double avg = hitDelays.stream().mapToLong(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
+        }
+
         void update(Location f, Location t) {
             double dy = Math.abs(t.getYaw() - f.getYaw());
             if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
+
+            latestDeltaYaw = Math.abs(t.getYaw() - f.getYaw());
+            latestDeltaPitch = Math.abs(t.getPitch() - f.getPitch());
+            latestAccelYaw = Math.abs(latestDeltaYaw - lastDeltaYaw);
+            lastDeltaYaw = latestDeltaYaw;
         }
     }
 
@@ -466,10 +528,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        LinkedList<Long> hitDelays = new LinkedList<>();
+        long lastHitTime = 0;
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
+
         void record(double d, double j, double a, double s, float p, double h) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
             if (d > maxDist) maxDist = d;
+
+            long now = System.currentTimeMillis();
+            if (lastHitTime > 0) {
+                hitDelays.add(now - lastHitTime);
+            }
+            lastHitTime = now;
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
@@ -478,6 +550,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+
+        double getDelayVariance() {
+            if (hitDelays.size() < 3) return 100.0;
+            double avg = hitDelays.stream().mapToLong(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
         }
     }
 }
