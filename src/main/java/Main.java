@@ -281,7 +281,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        int prevTargetId = tracker.lastTargetId;
+        long prevHitTime = tracker.lastHitTime;
+
+        tracker.recordHit(dist, hitHeightRatio, angle, target.getEntityId());
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -297,18 +300,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         double chance = 0;
 
-        // 1. Static Hitpoint / Target Box Checking
-        // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
-        if (Math.abs(hitHeightRatio - tracker.lastHitRatio) < 0.0001) {
-            tracker.stableHits++;
-        } else {
-            tracker.stableHits = 0;
-        }
-        tracker.lastHitRatio = hitHeightRatio;
-
-        // Если игрок в движении, и при этом он постоянно бьет ровно в 1 пиксель - это 100% чит.
-        if (tracker.stableHits >= 3 && playerMoving) {
-            chance += 65;
+        // 1. Hitpoint / Target Box Variance Checking (Randomizer Check)
+        // Если игрок бьет постоянно в одну точку (или с очень мелким рандомом), дисперсия будет крайне мала.
+        if (tracker.hitRatios.size() >= 5 && playerMoving) {
+            if (hitVar < 0.0001) {
+                // Бьет почти в одну точку (жесткий аимбот/киллаура)
+                chance += 65;
+            } else if (hitVar < 0.005) {
+                // Мелкий рандомизатор (пытается эмулировать легит)
+                chance += 45;
+            }
         }
 
         // 2. Reach Consistency
@@ -318,6 +319,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
+
+        // 3.5 Constant Aim / Lock-On Variance (Постоянная наводка)
+        double angleVar = tracker.getAngleVariance();
+        if (tracker.angles.size() >= 5 && (targetMoving || playerMoving)) {
+            if (angleVar < 0.05) chance += 55; // Идеальное следование
+            else if (angleVar < 0.5) chance += 35; // Слегка рандомизированное следование
+        }
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
@@ -337,8 +345,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if ((deltaYaw > 25.0 || deltaPitch > 15.0) && angle < 5.0) {
+            chance += 40; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        }
+
+        // 6. MultiAura (смена таргета за нечеловеческое время)
+        if (prevTargetId != -1 && prevTargetId != target.getEntityId()) {
+            long timeDiff = System.currentTimeMillis() - prevHitTime;
+            if (timeDiff < 100) { // Меньше 100 мс на переключение цели и точный удар
+                chance += 50;
+            }
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -423,8 +439,6 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     // Вспомогательные классы
     private static class PlayerMovementTracker {
-        double lastHitRatio = -1;
-        int stableHits = 0;
         double jitterScore = 0;
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
@@ -432,12 +446,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> angles = new LinkedList<>();
+        int lastTargetId = -1;
+        long lastHitTime = 0;
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle, int targetId) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
-            if (hitRatios.size() > 10) hitRatios.removeFirst();
-            if (hitDistances.size() > 10) hitDistances.removeFirst();
+            angles.add(angle);
+            if (hitRatios.size() > 25) hitRatios.removeFirst();
+            if (hitDistances.size() > 25) hitDistances.removeFirst();
+            if (angles.size() > 25) angles.removeFirst();
+
+            lastTargetId = targetId;
+            lastHitTime = System.currentTimeMillis();
         }
 
         double getHitVariance() {
@@ -450,6 +472,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitDistances.size() < 3) return 0.1;
             double avg = hitDistances.stream().mapToDouble(d -> d).average().orElse(0);
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
+        }
+
+        double getAngleVariance() {
+            if (angles.size() < 3) return 0.1;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
         }
 
         void update(Location f, Location t) {
