@@ -65,6 +65,29 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         setupFakeHP();
 
+        if (Bukkit.getPluginManager().getPlugin("ProtocolLib") != null) {
+            ProtocolLibrary.getProtocolManager().addPacketListener(
+                new PacketAdapter(this, ListenerPriority.NORMAL, PacketType.Play.Client.ARM_ANIMATION) {
+                    @Override
+                    public void onPacketReceiving(PacketEvent event) {
+                        Player p = event.getPlayer();
+                        PlayerMovementTracker t = movementTrackers.computeIfAbsent(p.getUniqueId(), k -> new PlayerMovementTracker());
+                        long now = System.currentTimeMillis();
+                        if (t.lastSwingTime > 0) {
+                            double diff = now - t.lastSwingTime;
+                            if (diff > 0 && diff < 500) {
+                                synchronized (t.clickIntervals) {
+                                    t.clickIntervals.add(diff);
+                                    if (t.clickIntervals.size() > 20) t.clickIntervals.remove(0);
+                                }
+                            }
+                        }
+                        t.lastSwingTime = now;
+                    }
+                }
+            );
+        }
+
         getLogger().info("OkakAC Vision 7.4 (Full & Dynamic) Loaded.");
     }
 
@@ -143,13 +166,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             }
         } else {
             if (s.hits == 0) return;
+            double avgYawVar = s.totalYawVar / s.hits;
+            double avgAngleVar = s.totalAngleVar / s.hits;
+            double avgClickVar = s.totalClickVar / s.hits;
+
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
                 sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage(String.format("§c[Данные] §7YawVar: %.2f, AngleVar: %.2f, ClickVar: %.2f", avgYawVar, avgAngleVar, avgClickVar));
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
                 sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage(String.format("§a[Данные] §7YawVar: %.2f, AngleVar: %.2f, ClickVar: %.2f", avgYawVar, avgAngleVar, avgClickVar));
             }
             modelReady = true;
         }
@@ -282,13 +311,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
         tracker.recordHit(dist, hitHeightRatio);
+        tracker.targetAngles.add(angle);
+        if (tracker.targetAngles.size() > 20) tracker.targetAngles.removeFirst();
+
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
+        double angleVar = tracker.getTargetAngleVariance();
+        double yawVar = tracker.getYawVariance();
+        double pitchVar = tracker.getPitchVariance();
+        double clickVar = tracker.getClickVariance();
 
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
-                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio, yawVar, angleVar, clickVar);
                 return;
             }
         }
@@ -319,10 +355,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
-        // 4. CPS
+        // 4. CPS & CPS Variance
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
+
+        if (clickVar < 5.0 && cps > 10) chance += 40; // Очень низкая дисперсия кликов (AutoClicker)
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -341,12 +379,30 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
+        // Kinematic Snap Detection (Acceleration spike)
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        if (accelYaw > 30.0 && deltaYaw > 20.0 && tracker.lastDeltaYaw < 2.0) {
+            chance += 45; // Мгновенный разгон с 0 до высокой скорости (механический Snap)
+        }
+
+        // 6. NoSwing / Order Check
+        if (tracker.lastSwingTime > 0 && Math.abs(System.currentTimeMillis() - tracker.lastSwingTime) > 250) {
+            chance += 40; // Удар без недавней анимации руки (NoSwing)
+        }
+
+        // 7. Randomizer KillAura
+        if (angleVar < 0.05 && (yawVar > 5.0 || pitchVar > 5.0) && tracker.targetAngles.size() >= 5) {
+            chance += 50; // Высокое дрожание головы, но идеально стабильный угол к цели
+        }
+
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
+        tracker.lastDeltaYaw = deltaYaw;
+        tracker.lastDeltaPitch = deltaPitch;
 
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
-            sendVisionStats(uuid, player.getName(), dist, angle, hitVar, (double) tracker.stableHits);
+            sendVisionStats(uuid, player.getName(), dist, angle, hitVar, (double) tracker.stableHits, clickVar);
         }
 
         // Вердикт
@@ -408,11 +464,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         return false;
     }
 
-    private void sendVisionStats(UUID id, String n, double d, double a, double v, double s) {
+    private void sendVisionStats(UUID id, String n, double d, double a, double v, double s, double cv) {
         activeVisions.forEach((ai, ti) -> {
             if (ti.equals(id)) {
                 Player adm = Bukkit.getPlayer(ai);
-                if (adm != null) adm.sendMessage(String.format("§8[V] §e%s §7D:%.1f A:%.1f V:%.3f S:%.0f", n, d, a, v, s));
+                if (adm != null) adm.sendMessage(String.format("§8[V] §e%s §7D:%.1f A:%.1f V:%.3f S:%.0f CV:%.1f", n, d, a, v, s, cv));
             }
         });
     }
@@ -432,6 +488,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+
+        volatile long lastSwingTime = 0;
+        float lastDeltaYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
+        LinkedList<Float> yawChanges = new LinkedList<>();
+        LinkedList<Float> pitchChanges = new LinkedList<>();
+        LinkedList<Double> targetAngles = new LinkedList<>();
+        List<Double> clickIntervals = Collections.synchronizedList(new LinkedList<>());
 
         void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
@@ -453,9 +517,42 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         void update(Location f, Location t) {
-            double dy = Math.abs(t.getYaw() - f.getYaw());
+            float dy = Math.abs(t.getYaw() - f.getYaw());
+            float dp = Math.abs(t.getPitch() - f.getPitch());
+
+            yawChanges.add(dy);
+            pitchChanges.add(dp);
+            if (yawChanges.size() > 20) yawChanges.removeFirst();
+            if (pitchChanges.size() > 20) pitchChanges.removeFirst();
+
             if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
+        }
+
+        double getYawVariance() {
+            if (yawChanges.size() < 3) return 0;
+            double avg = yawChanges.stream().mapToDouble(d -> d).average().orElse(0);
+            return yawChanges.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / yawChanges.size();
+        }
+
+        double getPitchVariance() {
+            if (pitchChanges.size() < 3) return 0;
+            double avg = pitchChanges.stream().mapToDouble(d -> d).average().orElse(0);
+            return pitchChanges.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / pitchChanges.size();
+        }
+
+        double getTargetAngleVariance() {
+            if (targetAngles.size() < 3) return 0;
+            double avg = targetAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return targetAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / targetAngles.size();
+        }
+
+        double getClickVariance() {
+            synchronized (clickIntervals) {
+                if (clickIntervals.size() < 5) return 50.0;
+                double avg = clickIntervals.stream().mapToDouble(d -> d).average().orElse(0);
+                return clickIntervals.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / clickIntervals.size();
+            }
         }
     }
 
@@ -464,11 +561,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         String type; // "killaura" или "speed"
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
+        double totalYawVar = 0, totalAngleVar = 0, totalClickVar = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
-        void record(double d, double j, double a, double s, float p, double h) {
+        void record(double d, double j, double a, double s, float p, double h, double yv, double av, double cv) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            totalYawVar += yv; totalAngleVar += av; totalClickVar += cv;
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
