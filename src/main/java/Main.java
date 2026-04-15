@@ -25,6 +25,7 @@ import com.comphenix.protocol.wrappers.WrappedDataWatcher;
 import com.comphenix.protocol.wrappers.WrappedWatchableObject;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
@@ -37,10 +38,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, TrainingSession> sessions = new HashMap<>();
     private final Map<UUID, Double> playerProbability = new HashMap<>();
     private final Map<UUID, Integer> violations = new HashMap<>();
-    private final Map<UUID, PlayerMovementTracker> movementTrackers = new HashMap<>();
+    private final Map<UUID, PlayerMovementTracker> movementTrackers = new ConcurrentHashMap<>();
     private final Map<UUID, UUID> activeVisions = new HashMap<>();
     private final Map<UUID, Location> lastSafeLocation = new HashMap<>();
-    private final Map<UUID, Integer> cpsTracker = new HashMap<>();
+    private final Map<UUID, Integer> cpsTracker = new ConcurrentHashMap<>();
 
     // Модели (Легит/Чит)
     private double cReach = 4.0, cAngle = 25.0, cSnap = 45.0, cJitter = 4.0;
@@ -64,8 +65,41 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         Bukkit.getScheduler().runTaskTimer(this, cpsTracker::clear, 20L, 20L);
 
         setupFakeHP();
+        setupProtocolLib();
 
         getLogger().info("OkakAC Vision 7.4 (Full & Dynamic) Loaded.");
+    }
+
+    private void setupProtocolLib() {
+        if (Bukkit.getPluginManager().getPlugin("ProtocolLib") == null) return;
+        ProtocolManager manager = ProtocolLibrary.getProtocolManager();
+
+        manager.addPacketListener(new PacketAdapter(this, ListenerPriority.NORMAL, PacketType.Play.Client.ARM_ANIMATION) {
+            @Override
+            public void onPacketReceiving(PacketEvent event) {
+                if (!isAntiCheatEnabled) return;
+                PlayerMovementTracker tracker = movementTrackers.get(event.getPlayer().getUniqueId());
+                if (tracker != null) {
+                    tracker.lastSwingTime = System.currentTimeMillis();
+                }
+            }
+        });
+
+        manager.addPacketListener(new PacketAdapter(this, ListenerPriority.NORMAL, PacketType.Play.Client.USE_ENTITY) {
+            @Override
+            public void onPacketReceiving(PacketEvent event) {
+                if (!isAntiCheatEnabled) return;
+                PlayerMovementTracker tracker = movementTrackers.get(event.getPlayer().getUniqueId());
+                if (tracker != null) {
+                    tracker.lastAttackTime = System.currentTimeMillis();
+                    if (Math.abs(tracker.lastAttackTime - tracker.lastSwingTime) > 50) {
+                        Bukkit.getScheduler().runTask(Main.this, () -> {
+                            processViolation(event.getPlayer(), 50, "Нет взмаха");
+                        });
+                    }
+                }
+            }
+        });
     }
 
     private void setupFakeHP() {
@@ -234,10 +268,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             // Increment violation and notify
             int vl = violations.getOrDefault(id, 0) + 1;
             violations.put(id, vl);
-            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag: §c" + flagReason + " §8(VL: " + vl + ")");
+            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Флаг: §c" + flagReason + " §8(VL: " + vl + ")");
 
             if (vl >= 20) {
-                handlePunishment(p, "Suspicious Movement (" + flagReason + ")");
+                handlePunishment(p, "Подозрительное движение (" + flagReason + ")");
                 violations.put(id, 0); // Reset after punishing
             }
         } else {
@@ -296,6 +330,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (!modelReady) return;
 
         double chance = 0;
+        StringBuilder reasons = new StringBuilder();
 
         // 1. Static Hitpoint / Target Box Checking
         // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
@@ -309,20 +344,43 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Если игрок в движении, и при этом он постоянно бьет ровно в 1 пиксель - это 100% чит.
         if (tracker.stableHits >= 3 && playerMoving) {
             chance += 65;
+            reasons.append("Статичный Хитбокс ");
+        }
+
+        if (hitVar < 0.0005 && tracker.hitRatios.size() >= 5 && playerMoving) {
+            chance += 50;
+            reasons.append("Идеальный Хитбокс ");
         }
 
         // 2. Reach Consistency
-        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) chance += 40;
+        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) {
+            chance += 40;
+            reasons.append("Reach/Киллаура ");
+        }
 
         // 3. Aim & Tracking (Прилипание)
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
         if (angle > lAngle * 1.5) chance += 30;
-        if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
+        if (angle < 0.8 && (targetMoving || playerMoving)) {
+            chance += 50;
+            reasons.append("Прилипание/Аим ");
+        }
+
+        tracker.angles.add(angle);
+        if (tracker.angles.size() > 10) tracker.angles.removeFirst();
+        double angleVar = tracker.getAngleVariance();
+        if (angleVar < 0.05 && angleVar > 0.0 && tracker.angles.size() >= 5 && playerMoving) {
+            chance += 60;
+            reasons.append("Рандомайзер головы/Аим ");
+        }
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
-        if (cps > 15) chance += 25;
+        if (cps > 15) {
+            chance += 25;
+            reasons.append("Аутокликер ");
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -337,8 +395,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if (deltaYaw > 20.0 && angle < 3.0) {
+            chance += 50; // Резко повернулся на большую дистанцию и сразу идеально навелся
+            reasons.append("Снап ");
+        } else if (deltaYaw > 25.0 && angle < 5.0) {
+            chance += 35;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -350,15 +411,17 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Вердикт
+        String finalReason = reasons.length() > 0 ? reasons.toString().trim() : "Подозрительное поведение (Aura)";
+
         if (chance > 85) {
             event.setCancelled(true);
-            processViolation(player, chance);
+            processViolation(player, chance, finalReason);
         } else if (chance > 40) {
-            processViolation(player, chance * 0.3);
+            processViolation(player, chance * 0.3, finalReason);
         }
     }
 
-    private void processViolation(Player p, double chance) {
+    public void processViolation(Player p, double chance, String reason) {
         UUID id = p.getUniqueId();
         double currentProb = playerProbability.getOrDefault(id, 0.0);
         double newProb = (currentProb * 0.7) + (chance * 0.3);
@@ -367,9 +430,9 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (newProb > 80) {
             int vl = violations.getOrDefault(id, 0) + 1;
             violations.put(id, vl);
-            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ")");
+            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Флаг! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ") §7- §e" + reason);
             if (vl >= 10) {
-                handlePunishment(p, "Suspicious Combat (KillAura/Aim)");
+                handlePunishment(p, reason);
                 violations.put(id, 0);
                 playerProbability.put(id, 0.0);
             }
@@ -380,14 +443,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         Bukkit.getScheduler().runTask(this, () -> {
             switch (punishmentMode.toLowerCase()) {
                 case "kick":
-                    player.kickPlayer("§cVision: " + reason);
+                    player.kickPlayer("§cVision (Кик): " + reason);
                     break;
                 case "warn":
                     player.sendMessage("§c§l[ВНИМАНИЕ] §eАнтичит обнаружил подозрительные действия: §f" + reason);
                     notifyAdmins("§8[§cOkakAC§8] §e" + player.getName() + " §7получил предупреждение за §c" + reason);
                     break;
                 case "flag":
-                    notifyAdmins("§8[§cOkakAC§8] §c[SILENT FLAG] §e" + player.getName() + " §7должен был быть кикнут за §c" + reason);
+                    notifyAdmins("§8[§cOkakAC§8] §c[СКРЫТЫЙ ФЛАГ] §e" + player.getName() + " §7должен был быть кикнут за §c" + reason);
                     break;
             }
         });
@@ -432,24 +495,33 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> angles = new LinkedList<>();
+        long lastSwingTime = 0;
+        long lastAttackTime = 0;
 
-        void recordHit(double dist, double ratio) {
+        synchronized void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
         }
 
-        double getHitVariance() {
+        synchronized double getHitVariance() {
             if (hitRatios.size() < 3) return 0.1;
             double avg = hitRatios.stream().mapToDouble(d -> d).average().orElse(0);
             return hitRatios.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitRatios.size();
         }
 
-        double getDistVariance() {
+        synchronized double getDistVariance() {
             if (hitDistances.size() < 3) return 0.1;
             double avg = hitDistances.stream().mapToDouble(d -> d).average().orElse(0);
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
+        }
+
+        synchronized double getAngleVariance() {
+            if (angles.size() < 3) return 10.0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
         }
 
         void update(Location f, Location t) {
@@ -466,9 +538,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); angles.add(a);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
@@ -478,6 +551,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
         }
     }
 }
