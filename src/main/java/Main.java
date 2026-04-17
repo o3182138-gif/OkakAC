@@ -75,6 +75,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         FakeHPHook.register(this);
+
+        // Register NoSwing Check
+        ProtocolLibrary.getProtocolManager().addPacketListener(new PacketAdapter(this, ListenerPriority.NORMAL, PacketType.Play.Client.ARM_ANIMATION) {
+            @Override
+            public void onPacketReceiving(PacketEvent event) {
+                if (!isAntiCheatEnabled) return;
+                Player p = event.getPlayer();
+                if (p == null) return;
+                UUID id = p.getUniqueId();
+                PlayerMovementTracker t = movementTrackers.computeIfAbsent(id, k -> new PlayerMovementTracker());
+                t.lastArmAnimation = System.currentTimeMillis();
+            }
+        });
     }
 
     @Override
@@ -281,7 +294,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -299,9 +312,14 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         // 1. Static Hitpoint / Target Box Checking
         // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
-        if (Math.abs(hitHeightRatio - tracker.lastHitRatio) < 0.0001) {
+        double heightShift = Math.abs(hitHeightRatio - tracker.lastHitRatio);
+        if (heightShift < 0.0001) {
             tracker.stableHits++;
         } else {
+            // Head Randomizer Detection
+            if (heightShift > 0.15 && playerMoving && targetMoving) {
+                chance += 25; // Слишком резкие и успешные скачки по высоте
+            }
             tracker.stableHits = 0;
         }
         tracker.lastHitRatio = hitHeightRatio;
@@ -319,7 +337,23 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
-        // 4. CPS
+        if (tracker.hitAngles.size() >= 5) {
+            double avgAngle = tracker.hitAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            if (avgAngle < 0.5 && playerMoving && targetMoving) chance += 45; // Constant tracking
+        }
+
+        // 4. Autoblock Check
+        if (player.isBlocking()) {
+            chance += 50; // Игрок блокирует во время удара
+        }
+
+        // 5. NoSwing Check
+        long timeSinceSwing = System.currentTimeMillis() - tracker.lastArmAnimation;
+        if (timeSinceSwing > 50) {
+            chance += 35; // Удар без анимации взмаха руки
+        }
+
+        // 6. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
@@ -341,8 +375,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
+        // Kinematic Snap
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        if (accelYaw > 20.0f && deltaYaw < 0.1f) {
+            chance += 30; // Моментальная остановка после быстрого поворота
+        }
+
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
+        tracker.lastDeltaYaw = deltaYaw;
 
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
@@ -423,6 +464,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
     // Вспомогательные классы
     private static class PlayerMovementTracker {
+        volatile long lastArmAnimation = 0;
         double lastHitRatio = -1;
         int stableHits = 0;
         double jitterScore = 0;
@@ -432,12 +474,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> hitAngles = new LinkedList<>();
+        float lastDeltaYaw = 0.0f;
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            hitAngles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (hitAngles.size() > 10) hitAngles.removeFirst();
         }
 
         double getHitVariance() {
@@ -466,9 +512,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> angles = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); angles.add(a);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
@@ -478,6 +525,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+        double getAngleVariance() {
+            if (angles.size() < 2) return 0;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
         }
     }
 }
