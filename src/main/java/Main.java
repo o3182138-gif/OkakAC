@@ -210,6 +210,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             flagReason = "Speed (" + String.format("%.2f", speedH) + " > " + String.format("%.2f", limitH) + ")";
         }
 
+        if (distY < -0.5 && p.isOnGround() && to.clone().subtract(0, 0.1, 0).getBlock().getType() == Material.AIR) {
+            flagged = true;
+            flagReason = "NoFall (dy=" + String.format("%.2f", distY) + ")";
+        }
+
         // Fly / Hover Check
         // Gravity usually pulls player down. If they are in air and moving up without jump, or hovering (distY == 0), it's sus.
         // For simplicity, we check if they are in air for too long without falling properly.
@@ -281,9 +286,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        long currentTime = System.currentTimeMillis();
+        if (tracker.lastAttackTime != 0) {
+            long delay = currentTime - tracker.lastAttackTime;
+            tracker.attackDelays.add(delay);
+            if (tracker.attackDelays.size() > 10) tracker.attackDelays.removeFirst();
+        }
+        tracker.lastAttackTime = currentTime;
+
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
+        double angleVar = tracker.getAngleVariance();
 
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
@@ -319,10 +333,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
-        // 4. CPS
+        // 4. CPS & AutoClicker
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
+        if (cps > 10 && tracker.getDelayVariance() < 50) {
+            chance += 30; // Обнаружена подозрительная стабильность кликов (Автокликер)
+        }
+
+        // Constant Aura / Head Randomizer
+        if (angleVar < 0.5 && hitVar > 0.05) {
+            chance += 35; // Искусственный разброс головы при постоянной наводке
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -337,12 +359,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
+        float accelYaw = Math.abs(deltaYaw - tracker.lastDeltaYaw);
+        float accelPitch = Math.abs(deltaPitch - tracker.lastDeltaPitch);
+
+        if ((accelYaw > 30.0 || accelPitch > 30.0) && angle < 5.0) {
+            chance += 45; // Резкий скачок угла, за которым последовала идеальная остановка на цели
+        } else if (deltaYaw > 25.0 && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
         tracker.lastYaw = player.getLocation().getYaw();
+        tracker.lastDeltaYaw = deltaYaw;
+        tracker.lastDeltaPitch = deltaPitch;
 
         // Vision Stats для админа
         if (activeVisions.containsValue(uuid)) {
@@ -429,15 +458,22 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
+        float lastDeltaYaw = 0.0f;
         int airTicks = 0;
+        long lastAttackTime = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> angles = new LinkedList<>();
+        LinkedList<Long> attackDelays = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            angles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (angles.size() > 10) angles.removeFirst();
         }
 
         double getHitVariance() {
@@ -450,6 +486,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (hitDistances.size() < 3) return 0.1;
             double avg = hitDistances.stream().mapToDouble(d -> d).average().orElse(0);
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
+        }
+
+        double getAngleVariance() {
+            if (angles.size() < 3) return 0.1;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+
+        double getDelayVariance() {
+            if (attackDelays.size() < 3) return 1000.0;
+            double avg = attackDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return attackDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / attackDelays.size();
         }
 
         void update(Location f, Location t) {
