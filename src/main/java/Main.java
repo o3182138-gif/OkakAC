@@ -281,7 +281,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordHit(dist, hitHeightRatio, angle);
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -337,8 +337,8 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if ((deltaYaw > 20.0 || deltaPitch > 15.0) && angle < 5.0 && dist > 1.5) {
+            chance += 40; // Резко повернулся на большую дистанцию и сразу идеально навелся
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -348,6 +348,17 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (activeVisions.containsValue(uuid)) {
             sendVisionStats(uuid, player.getName(), dist, angle, hitVar, (double) tracker.stableHits);
         }
+
+        // Aim Randomizer (Constant Aura) & MultiAura
+        double angleVar = tracker.getAngleVariance();
+        if (tracker.hitAngles.size() >= 5 && playerMoving && angleVar > 0.0 && angleVar < 0.5) {
+            chance += 30;
+        }
+        if (tracker.lastTarget != null && !tracker.lastTarget.equals(target.getUniqueId()) && (System.currentTimeMillis() - tracker.lastAttackTime) < 50) {
+            chance += 50;
+        }
+        tracker.lastTarget = target.getUniqueId();
+        tracker.lastAttackTime = System.currentTimeMillis();
 
         // Вердикт
         if (chance > 85) {
@@ -432,12 +443,23 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> hitAngles = new LinkedList<>();
+        UUID lastTarget = null;
+        long lastAttackTime = 0;
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
+            hitAngles.add(angle);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+            if (hitAngles.size() > 10) hitAngles.removeFirst();
+        }
+
+        double getAngleVariance() {
+            if (hitAngles.size() < 3) return 0.1;
+            double avg = hitAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitAngles.size();
         }
 
         double getHitVariance() {
@@ -466,13 +488,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> hitAngles = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); hitAngles.add(a);
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
+        }
+        double getAngleVariance() {
+            if (hitAngles.size() < 2) return 0;
+            double avg = hitAngles.stream().mapToDouble(val -> val).average().orElse(0);
+            return hitAngles.stream().mapToDouble(val -> Math.pow(val - avg, 2)).sum() / hitAngles.size();
         }
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
