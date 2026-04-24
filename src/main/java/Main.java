@@ -42,6 +42,10 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Location> lastSafeLocation = new HashMap<>();
     private final Map<UUID, Integer> cpsTracker = new HashMap<>();
 
+    public PlayerMovementTracker getMovementTracker(UUID uuid) {
+        return movementTrackers.computeIfAbsent(uuid, k -> new PlayerMovementTracker());
+    }
+
     // Модели (Легит/Чит)
     private double cReach = 4.0, cAngle = 25.0, cSnap = 45.0, cJitter = 4.0;
     private double lReach = 3.0, lAngle = 12.0, lSnap = 15.0, lJitter = 1.0, lPrecision = 3.0;
@@ -62,6 +66,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         // Очистка CPS каждую секунду
         Bukkit.getScheduler().runTaskTimer(this, cpsTracker::clear, 20L, 20L);
+
+        // NoSwing (Packet Listener)
+        if (Bukkit.getPluginManager().getPlugin("ProtocolLib") != null) {
+            NoSwingHook.register(this);
+        }
 
         setupFakeHP();
 
@@ -281,7 +290,11 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean targetMoving = target.getVelocity().length() > 0.05;
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
-        tracker.recordHit(dist, hitHeightRatio);
+        long now = System.currentTimeMillis();
+        long delay = now - tracker.lastAttackTime;
+        tracker.lastAttackTime = now;
+        tracker.recordHit(dist, hitHeightRatio, angle, delay);
+
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
@@ -296,6 +309,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (!modelReady) return;
 
         double chance = 0;
+        StringBuilder reasons = new StringBuilder();
 
         // 1. Static Hitpoint / Target Box Checking
         // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
@@ -309,20 +323,45 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Если игрок в движении, и при этом он постоянно бьет ровно в 1 пиксель - это 100% чит.
         if (tracker.stableHits >= 3 && playerMoving) {
             chance += 65;
+            reasons.append("Статичный хитбокс; ");
         }
 
         // 2. Reach Consistency
-        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) chance += 40;
+        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) {
+            chance += 40;
+            reasons.append("Стабильная дистанция; ");
+        }
 
         // 3. Aim & Tracking (Прилипание)
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
-        if (angle > lAngle * 1.5) chance += 30;
-        if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
+        if (angle > lAngle * 1.5) {
+            chance += 30;
+            reasons.append("Плохая наводка; ");
+        }
+        if (angle < 0.8 && (targetMoving || playerMoving)) {
+            chance += 50;
+            reasons.append("Идеальная наводка; ");
+        }
+
+        // Head Randomizer Check
+        if (tracker.hitAngles.size() >= 5 && tracker.getAngleVariance() > 0.0001 && tracker.getAngleVariance() < 0.05) {
+            chance += 30;
+            reasons.append("Рандомайзер головы; ");
+        }
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
-        if (cps > 15) chance += 25;
+        if (cps > 15) {
+            chance += 25;
+            reasons.append("Высокий CPS; ");
+        }
+
+        // AutoClicker Check
+        if (tracker.hitDelays.size() >= 5 && tracker.getDelayVariance() < 500) {
+            chance += 35;
+            reasons.append("Автокликер (Стабильные удары); ");
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -331,14 +370,25 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         if (deltaPitch > 0 && deltaPitch < 0.01) {
             tracker.gcdFlaws++;
-            if (tracker.gcdFlaws > 5) chance += 20;
+            if (tracker.gcdFlaws > 5) {
+                chance += 20;
+                reasons.append("Неестественное вращение (GCD); ");
+            }
         } else {
             tracker.gcdFlaws = 0;
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if (tracker.cumulativeYawDelta > 45.0 && angle < 2.0) {
+            chance += 45; // Резко повернулся на большую дистанцию и сразу идеально навелся
+            reasons.append("Резкая наводка (Snap); ");
+        }
+        tracker.cumulativeYawDelta = 0;
+
+        // NoSwing Check
+        if (now - tracker.lastSwingTime > 150) {
+            chance += 25;
+            reasons.append("Отсутствует анимация руки (NoSwing); ");
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -352,13 +402,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Вердикт
         if (chance > 85) {
             event.setCancelled(true);
-            processViolation(player, chance);
+            processViolation(player, chance, reasons.toString());
         } else if (chance > 40) {
-            processViolation(player, chance * 0.3);
+            processViolation(player, chance * 0.3, reasons.toString());
         }
     }
 
-    private void processViolation(Player p, double chance) {
+    private void processViolation(Player p, double chance, String reason) {
         UUID id = p.getUniqueId();
         double currentProb = playerProbability.getOrDefault(id, 0.0);
         double newProb = (currentProb * 0.7) + (chance * 0.3);
@@ -367,7 +417,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (newProb > 80) {
             int vl = violations.getOrDefault(id, 0) + 1;
             violations.put(id, vl);
-            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ")");
+            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8- §e" + reason + "§8(VL: " + vl + ")");
             if (vl >= 10) {
                 handlePunishment(p, "Suspicious Combat (KillAura/Aim)");
                 violations.put(id, 0);
@@ -422,7 +472,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     // Вспомогательные классы
-    private static class PlayerMovementTracker {
+    public static class PlayerMovementTracker {
         double lastHitRatio = -1;
         int stableHits = 0;
         double jitterScore = 0;
@@ -430,14 +480,23 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
         int airTicks = 0;
+        double cumulativeYawDelta = 0;
+        volatile long lastSwingTime = 0;
+        volatile long lastAttackTime = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> hitAngles = new LinkedList<>();
+        LinkedList<Long> hitDelays = new LinkedList<>();
 
-        void recordHit(double dist, double ratio) {
+        void recordHit(double dist, double ratio, double angle, long delay) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
-            if (hitRatios.size() > 10) hitRatios.removeFirst();
-            if (hitDistances.size() > 10) hitDistances.removeFirst();
+            hitAngles.add(angle);
+            hitDelays.add(delay);
+            if (hitRatios.size() > 25) hitRatios.removeFirst();
+            if (hitDistances.size() > 25) hitDistances.removeFirst();
+            if (hitAngles.size() > 25) hitAngles.removeFirst();
+            if (hitDelays.size() > 25) hitDelays.removeFirst();
         }
 
         double getHitVariance() {
@@ -452,8 +511,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
 
+        double getAngleVariance() {
+            if (hitAngles.size() < 3) return 0.1;
+            double avg = hitAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitAngles.size();
+        }
+
+        double getDelayVariance() {
+            if (hitDelays.size() < 3) return 0.1;
+            double avg = hitDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDelays.size();
+        }
+
         void update(Location f, Location t) {
             double dy = Math.abs(t.getYaw() - f.getYaw());
+            cumulativeYawDelta += dy;
             if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
         }
