@@ -296,6 +296,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (!modelReady) return;
 
         double chance = 0;
+        List<String> reasons = new ArrayList<>();
 
         // 1. Static Hitpoint / Target Box Checking
         // Если игрок стоит на месте, хитбокс не будет меняться, и это нормально (поэтому мы проверяем движение).
@@ -309,20 +310,40 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Если игрок в движении, и при этом он постоянно бьет ровно в 1 пиксель - это 100% чит.
         if (tracker.stableHits >= 3 && playerMoving) {
             chance += 65;
+            reasons.add("Static Hitpoint");
         }
 
         // 2. Reach Consistency
-        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) chance += 40;
+        if (distVar < 0.001 && tracker.hitDistances.size() >= 5 && playerMoving) {
+            chance += 40;
+            reasons.add("Reach Consistency");
+        }
 
         // 3. Aim & Tracking (Прилипание)
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
-        if (angle > lAngle * 1.5) chance += 30;
-        if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
+        if (angle > lAngle * 1.5) {
+            chance += 30;
+            reasons.add("High Angle");
+        }
+        if (angle < 0.8 && (targetMoving || playerMoving)) {
+            chance += 50;
+            reasons.add("Aim Lock (Perfect Angle)");
+        }
+
+        tracker.recordAngle(angle);
+        double angleVar = tracker.getAngleVariance();
+        if (tracker.angles.size() >= 5 && angleVar < 0.05 && (targetMoving || playerMoving)) {
+            chance += 45; // Постоянная киллаура поддерживает идеальный угол (залипание) длительное время
+            reasons.add("Aim Lock (Low Angle Variance: " + String.format("%.3f", angleVar) + ")");
+        }
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
-        if (cps > 15) chance += 25;
+        if (cps > 15) {
+            chance += 25;
+            reasons.add("High CPS");
+        }
 
         // 5. GCD (Greatest Common Divisor) Flaw & Snap
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
@@ -331,14 +352,35 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
 
         if (deltaPitch > 0 && deltaPitch < 0.01) {
             tracker.gcdFlaws++;
-            if (tracker.gcdFlaws > 5) chance += 20;
+            if (tracker.gcdFlaws > 5) {
+                chance += 20;
+                reasons.add("GCD Flaw");
+            }
         } else {
             tracker.gcdFlaws = 0;
         }
 
-        // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        // Обнаружение резких наводок (Snap)
+        // Анализируем изменение скорости поворота головы (ускорение/рывок).
+        // Если в предыдущий тик игрок двигал камерой очень быстро, а сейчас резко остановился и ударил.
+        float currentDeltaYaw = Math.abs(tracker.lastDeltaYaw);
+        if (currentDeltaYaw > cSnap && deltaYaw < 2.0 && angle < 5.0) {
+            chance += 35; // Слишком резкая остановка мыши при точном наведении
+            reasons.add("Snap Aim");
+        } else if (deltaYaw > cSnap && angle < 5.0) {
+            chance += 25; // Резко повернулся и сразу ударил
+            reasons.add("Fast Turn Aim");
+        }
+
+        // Head Randomizer Check
+        // Анализ "зубчатых" движений (частая смена направления вращения головы)
+        int directionChanges = tracker.getYawDirectionChanges();
+        if (directionChanges >= 12 && tracker.yawDeltas.size() >= 15) {
+            chance += 30; // Человек не может так часто менять направление движения мыши с такой частотой
+            reasons.add("Head Randomizer (" + directionChanges + " changes)");
+        } else if (directionChanges >= 8 && tracker.yawDeltas.size() >= 15) {
+            chance += 15;
+            reasons.add("Sus Head Randomizer");
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -350,15 +392,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Вердикт
-        if (chance > 85) {
-            event.setCancelled(true);
-            processViolation(player, chance);
-        } else if (chance > 40) {
-            processViolation(player, chance * 0.3);
+        if (chance > 0) {
+            String combinedReasons = String.join(", ", reasons);
+            if (chance > 85) {
+                event.setCancelled(true);
+                processViolation(player, chance, combinedReasons);
+            } else if (chance > 40) {
+                processViolation(player, chance * 0.3, combinedReasons);
+            }
         }
     }
 
-    private void processViolation(Player p, double chance) {
+    private void processViolation(Player p, double chance, String reason) {
         UUID id = p.getUniqueId();
         double currentProb = playerProbability.getOrDefault(id, 0.0);
         double newProb = (currentProb * 0.7) + (chance * 0.3);
@@ -367,9 +412,9 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (newProb > 80) {
             int vl = violations.getOrDefault(id, 0) + 1;
             violations.put(id, vl);
-            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8(VL: " + vl + ")");
+            notifyAdmins("§8[§cOkakAC§8] §e" + p.getName() + " §7Flag! §c" + String.format("%.0f", newProb) + "% §8- §e" + reason + " §8(VL: " + vl + ")");
             if (vl >= 10) {
-                handlePunishment(p, "Suspicious Combat (KillAura/Aim)");
+                handlePunishment(p, "Suspicious Combat (" + reason + ")");
                 violations.put(id, 0);
                 playerProbability.put(id, 0.0);
             }
@@ -433,11 +478,46 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
 
+        // New fields for advanced heuristics
+        LinkedList<Float> yawDeltas = new LinkedList<>();
+        LinkedList<Float> pitchDeltas = new LinkedList<>();
+        LinkedList<Double> angles = new LinkedList<>();
+        float lastDeltaYaw = 0.0f;
+        float lastDeltaPitch = 0.0f;
+
         void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+        }
+
+        void recordAngle(double angle) {
+            angles.add(angle);
+            if (angles.size() > 20) angles.removeFirst();
+        }
+
+        double getAngleVariance() {
+            if (angles.size() < 3) return 0.1;
+            double avg = angles.stream().mapToDouble(d -> d).average().orElse(0);
+            return angles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / angles.size();
+        }
+
+        int getYawDirectionChanges() {
+            if (yawDeltas.size() < 3) return 0;
+            int changes = 0;
+            boolean wasPositive = yawDeltas.get(0) > 0;
+            for (int i = 1; i < yawDeltas.size(); i++) {
+                float val = yawDeltas.get(i);
+                if (Math.abs(val) > 0.01) {
+                    boolean isPositive = val > 0;
+                    if (isPositive != wasPositive) {
+                        changes++;
+                        wasPositive = isPositive;
+                    }
+                }
+            }
+            return changes;
         }
 
         double getHitVariance() {
@@ -453,9 +533,21 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         void update(Location f, Location t) {
-            double dy = Math.abs(t.getYaw() - f.getYaw());
+            float deltaYaw = t.getYaw() - f.getYaw();
+            float deltaPitch = t.getPitch() - f.getPitch();
+
+            yawDeltas.add(deltaYaw);
+            pitchDeltas.add(deltaPitch);
+
+            if (yawDeltas.size() > 20) yawDeltas.removeFirst();
+            if (pitchDeltas.size() > 20) pitchDeltas.removeFirst();
+
+            double dy = Math.abs(deltaYaw);
             if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
+
+            lastDeltaYaw = deltaYaw;
+            lastDeltaPitch = deltaPitch;
         }
     }
 
@@ -466,18 +558,29 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
+        List<Double> recordedAngles = new ArrayList<>();
+
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
+
         void record(double d, double j, double a, double s, float p, double h) {
-            hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            hits++; totalDist += d; totalAngle += a; hitHeights.add(h); recordedAngles.add(a);
             if (d > maxDist) maxDist = d;
         }
+
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
         }
+
         double getHitVariance() {
             if (hitHeights.size() < 2) return 0;
             double avg = hitHeights.stream().mapToDouble(d -> d).average().orElse(0);
             return hitHeights.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitHeights.size();
+        }
+
+        double getAngleVariance() {
+            if (recordedAngles.size() < 2) return 0;
+            double avg = recordedAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return recordedAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / recordedAngles.size();
         }
     }
 }
