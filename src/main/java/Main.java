@@ -146,10 +146,12 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             if (s.isCheat) {
                 cReach = s.maxDist; cAngle = s.totalAngle / s.hits;
                 sender.sendMessage("§c[AC] Модель ЧИТА (KillAura) обновлена.");
+                sender.sendMessage(String.format("§7[Data] DirChanges: %d, Snaps: %d, PerfectTicks: %d", s.totalDirectionChanges, s.totalSuspiciousSnaps, s.totalPerfectTrackingTicks));
             } else {
                 lReach = s.maxDist; lAngle = s.totalAngle / s.hits;
                 lHitVariance = s.getHitVariance();
                 sender.sendMessage("§a[AC] Модель ЛЕГИТА (KillAura) обновлена.");
+                sender.sendMessage(String.format("§7[Data] DirChanges: %d, Snaps: %d, PerfectTicks: %d", s.totalDirectionChanges, s.totalSuspiciousSnaps, s.totalPerfectTrackingTicks));
             }
             modelReady = true;
         }
@@ -289,6 +291,7 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
                 s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                s.recordExtraStats(tracker.directionChanges, tracker.suspiciousSnaps, tracker.perfectTrackingTicks);
                 return;
             }
         }
@@ -317,14 +320,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // 3. Aim & Tracking (Прилипание)
         // Если угол наводки почти 0 (идеально смотрит на центр) и при этом игрок или цель движутся.
         if (angle > lAngle * 1.5) chance += 30;
-        if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
+        if (angle < 0.8 && (targetMoving || playerMoving)) {
+            tracker.perfectTrackingTicks++;
+            chance += 50 + (tracker.perfectTrackingTicks * 5); // Constant tracking
+        } else {
+            tracker.perfectTrackingTicks = 0;
+        }
 
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
         if (cps > 15) chance += 25;
 
-        // 5. GCD (Greatest Common Divisor) Flaw & Snap
+        // 5. GCD (Greatest Common Divisor) Flaw & Snap & Randomizer
         // Обнаружение неестественных (идеальных) вращений, характерных для киллаур, которые не учитывают чувствительность мыши.
         float deltaPitch = Math.abs(player.getLocation().getPitch() - tracker.lastPitch);
         float deltaYaw = Math.abs(player.getLocation().getYaw() - tracker.lastYaw);
@@ -339,6 +347,18 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         // Обнаружение резких наводок (Snap) перед ударом
         if (deltaYaw > 25.0 && angle < 5.0) {
             chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        }
+
+        // Mechanical Snaps detected from onMove
+        if (tracker.suspiciousSnaps > 0) {
+            chance += 20 * tracker.suspiciousSnaps;
+            tracker.suspiciousSnaps = 0; // reset after applying
+        }
+
+        // Head randomizer: close angle but very high direction changes
+        if (tracker.directionChanges > 5 && angle < 5.0 && hitVar > 0.05) {
+            chance += 45;
+            tracker.directionChanges = 0;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -429,6 +449,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int gcdFlaws = 0;
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+
+        float lastTickYaw = 0.0f;
+        float lastTickPitch = 0.0f;
+        float lastDeltaYaw = 0.0f;
+        int suspiciousSnaps = 0;
+        int directionChanges = 0;
+        LinkedList<Float> yawDeltas = new LinkedList<>();
+        int perfectTrackingTicks = 0;
+
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
@@ -453,7 +482,39 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         void update(Location f, Location t) {
-            double dy = Math.abs(t.getYaw() - f.getYaw());
+            float toYaw = t.getYaw();
+            float toPitch = t.getPitch();
+
+            float deltaYaw = Math.abs(toYaw - lastTickYaw);
+            float signedDeltaYaw = toYaw - lastTickYaw;
+            float deltaPitch = Math.abs(toPitch - lastTickPitch);
+
+            // Snaps check: sudden massive movement that stops instantly
+            float accelYaw = Math.abs(deltaYaw - lastDeltaYaw);
+            if (accelYaw > 20.0f && deltaYaw < 2.0f && lastDeltaYaw > 20.0f) {
+                suspiciousSnaps++;
+            } else if (deltaYaw > 5.0f) {
+                suspiciousSnaps = Math.max(0, suspiciousSnaps - 1);
+            }
+
+            // Head randomizer check: unnatural jitter in direction
+            if (yawDeltas.size() > 0) {
+                float lastSign = Math.signum(yawDeltas.getLast());
+                float currentSign = Math.signum(signedDeltaYaw);
+                if (lastSign != 0 && currentSign != 0 && lastSign != currentSign && deltaYaw > 1.0f) {
+                    directionChanges++;
+                } else {
+                    directionChanges = Math.max(0, directionChanges - 1);
+                }
+            }
+            yawDeltas.add(signedDeltaYaw);
+            if (yawDeltas.size() > 20) yawDeltas.removeFirst();
+
+            lastDeltaYaw = deltaYaw;
+            lastTickYaw = toYaw;
+            lastTickPitch = toPitch;
+
+            double dy = deltaYaw;
             if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
         }
@@ -465,11 +526,19 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
+        int totalDirectionChanges = 0;
+        int totalSuspiciousSnaps = 0;
+        int totalPerfectTrackingTicks = 0;
         List<Double> hitHeights = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
         void record(double d, double j, double a, double s, float p, double h) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
             if (d > maxDist) maxDist = d;
+        }
+        void recordExtraStats(int directionChanges, int suspiciousSnaps, int perfectTrackingTicks) {
+            this.totalDirectionChanges += directionChanges;
+            this.totalSuspiciousSnaps += suspiciousSnaps;
+            this.totalPerfectTrackingTicks += perfectTrackingTicks;
         }
         void recordSpeed(double speedH) {
             if (speedH > maxSpeedH) maxSpeedH = speedH;
