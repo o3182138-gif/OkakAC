@@ -8,7 +8,9 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffectType;
@@ -248,6 +250,23 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     @EventHandler
+    public void onInteract(PlayerInteractEvent event) {
+        if (!isAntiCheatEnabled) return;
+        if (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK) {
+            Player player = event.getPlayer();
+            UUID uuid = player.getUniqueId();
+            PlayerMovementTracker tracker = movementTrackers.computeIfAbsent(uuid, k -> new PlayerMovementTracker());
+
+            long now = System.currentTimeMillis();
+            if (tracker.lastClickTime > 0) {
+                double delay = now - tracker.lastClickTime;
+                tracker.recordClickDelay(delay);
+            }
+            tracker.lastClickTime = now;
+        }
+    }
+
+    @EventHandler
     public void onAttack(EntityDamageByEntityEvent event) {
         if (!isAntiCheatEnabled || !(event.getDamager() instanceof Player)) return;
 
@@ -282,13 +301,15 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         boolean playerMoving = player.getVelocity().length() > 0.05;
 
         tracker.recordHit(dist, hitHeightRatio);
+        tracker.recordAngle(angle);
+
         double hitVar = tracker.getHitVariance();
         double distVar = tracker.getDistVariance();
 
         if (sessions.containsKey(uuid)) {
             TrainingSession s = sessions.get(uuid);
             if (s.type.equals("killaura")) {
-                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio);
+                s.record(dist, tracker.jitterScore, angle, 0, eye.getPitch(), hitHeightRatio, tracker.yawAccel, tracker.getAngleVariance());
                 return;
             }
         }
@@ -319,6 +340,16 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         if (angle > lAngle * 1.5) chance += 30;
         if (angle < 0.8 && (targetMoving || playerMoving)) chance += 50;
 
+        // Constant Tracking check
+        if (angle < 2.0 && (targetMoving || playerMoving)) {
+            tracker.trackingTicks++;
+            if (tracker.trackingTicks > 4) {
+                chance += 60;
+            }
+        } else {
+            tracker.trackingTicks = 0;
+        }
+
         // 4. CPS
         int cps = cpsTracker.getOrDefault(uuid, 0) + 1;
         cpsTracker.put(uuid, cps);
@@ -337,8 +368,20 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // Обнаружение резких наводок (Snap) перед ударом
-        if (deltaYaw > 25.0 && angle < 5.0) {
-            chance += 35; // Резко повернулся на большую дистанцию и сразу идеально навелся
+        if (tracker.yawAccel > 20.0 && angle < 5.0 && Math.abs(tracker.lastDeltaYaw) < 2.0) {
+            chance += 45; // Мгновенный перепад ускорения наведения к малом углу
+        }
+
+        // Head Randomizer
+        double deltaYawVar = tracker.getDeltaYawVariance();
+        double angleVar = tracker.getAngleVariance();
+        if (deltaYawVar > 50.0 && angleVar < 0.1) {
+            chance += 50;
+        }
+
+        // AutoClicker timing check
+        if (tracker.clickDelays.size() >= 10 && tracker.getClickVariance() < 5.0) {
+            chance += 35;
         }
 
         tracker.lastPitch = player.getLocation().getPitch();
@@ -427,17 +470,39 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         int stableHits = 0;
         double jitterScore = 0;
         int gcdFlaws = 0;
+
         float lastPitch = 0.0f;
         float lastYaw = 0.0f;
+        double lastDeltaYaw = 0.0;
+        double lastDeltaPitch = 0.0;
+        double yawAccel = 0.0;
+        double pitchAccel = 0.0;
+
+        int trackingTicks = 0;
+        long lastClickTime = 0;
+
         int airTicks = 0;
         LinkedList<Double> hitRatios = new LinkedList<>();
         LinkedList<Double> hitDistances = new LinkedList<>();
+        LinkedList<Double> hitAngles = new LinkedList<>();
+        LinkedList<Double> deltaYaws = new LinkedList<>();
+        LinkedList<Double> clickDelays = new LinkedList<>();
 
         void recordHit(double dist, double ratio) {
             hitRatios.add(ratio);
             hitDistances.add(dist);
             if (hitRatios.size() > 10) hitRatios.removeFirst();
             if (hitDistances.size() > 10) hitDistances.removeFirst();
+        }
+
+        void recordAngle(double angle) {
+            hitAngles.add(angle);
+            if (hitAngles.size() > 10) hitAngles.removeFirst();
+        }
+
+        void recordClickDelay(double delay) {
+            clickDelays.add(delay);
+            if (clickDelays.size() > 20) clickDelays.removeFirst();
         }
 
         double getHitVariance() {
@@ -452,9 +517,43 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
             return hitDistances.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitDistances.size();
         }
 
+        double getAngleVariance() {
+            if (hitAngles.size() < 3) return 0.1;
+            double avg = hitAngles.stream().mapToDouble(d -> d).average().orElse(0);
+            return hitAngles.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / hitAngles.size();
+        }
+
+        double getDeltaYawVariance() {
+            if (deltaYaws.size() < 3) return 0.1;
+            double avg = deltaYaws.stream().mapToDouble(d -> d).average().orElse(0);
+            return deltaYaws.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / deltaYaws.size();
+        }
+
+        double getClickVariance() {
+            if (clickDelays.size() < 5) return 50.0;
+            double avg = clickDelays.stream().mapToDouble(d -> d).average().orElse(0);
+            return clickDelays.stream().mapToDouble(d -> Math.pow(d - avg, 2)).sum() / clickDelays.size();
+        }
+
         void update(Location f, Location t) {
-            double dy = Math.abs(t.getYaw() - f.getYaw());
-            if (dy > 0.1 && dy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
+            double dy = t.getYaw() - f.getYaw();
+            while (dy > 180f) dy -= 360f;
+            while (dy < -180f) dy += 360f;
+            double absDy = Math.abs(dy);
+
+            double dp = t.getPitch() - f.getPitch();
+            double absDp = Math.abs(dp);
+
+            yawAccel = Math.abs(absDy - lastDeltaYaw);
+            pitchAccel = Math.abs(absDp - lastDeltaPitch);
+
+            lastDeltaYaw = absDy;
+            lastDeltaPitch = absDp;
+
+            deltaYaws.add(absDy);
+            if (deltaYaws.size() > 20) deltaYaws.removeFirst();
+
+            if (absDy > 0.1 && absDy < 10) jitterScore = Math.min(5, jitterScore + 0.5);
             else jitterScore = Math.max(0, jitterScore - 0.1);
         }
     }
@@ -464,11 +563,13 @@ public class Main extends JavaPlugin implements Listener, CommandExecutor {
         String type; // "killaura" или "speed"
         int hits = 0;
         double totalDist = 0, totalJitter = 0, totalAngle = 0, maxDist = 0;
+        double totalYawAccel = 0, totalAngleVar = 0;
         double maxSpeedH = 0; // Максимальная записанная скорость по X/Z
         List<Double> hitHeights = new ArrayList<>();
         TrainingSession(boolean c, String t) { isCheat = c; type = t; }
-        void record(double d, double j, double a, double s, float p, double h) {
+        void record(double d, double j, double a, double s, float p, double h, double ya, double av) {
             hits++; totalDist += d; totalAngle += a; hitHeights.add(h);
+            totalYawAccel += ya; totalAngleVar += av;
             if (d > maxDist) maxDist = d;
         }
         void recordSpeed(double speedH) {
